@@ -5,13 +5,14 @@
 The architecture isolates operations across three boundaries:
 1. **Read-Only Adapter**: Pinned `osxphotos==0.76.1` normalization. Performs read-only queries against selected libraries, with zero SQLite write or mutation capacity.
 2. **Swift Helper Process**: A compiled native binary performing PhotoKit mutations against the System Photo Library via `PHPhotoLibrary.shared()`. AppleScript or GUI automation is prohibited.
-3. **Python Orchestrator**: CLI argument parsing, asset/album filtering, deterministic manifest generation, HMAC-SHA-256 deletion authorization, advisory locking, and JSON/JSONL formatting.
+3. **Python Orchestrator**: CLI argument parsing, asset/album filtering, deterministic manifest generation, read-only pixel evidence, HMAC-SHA-256 deletion authorization, advisory locking, and JSON/JSONL formatting.
 
 ## Core Safety Invariants
 
 - **SQLite Writes**: Prohibited.
 - **Library Snapshots**: Manifests bind to the sorted PhotoKit asset-ID-set digest. This detects content-set drift; it does not verify physical library identity.
 - **Deduplication**: Requires complete SHA-256 resource equality. Timestamps, names, sizes, or metadata fingerprints are insufficient.
+- **Pixel Evidence**: Freezes each input as one bounded byte snapshot, rejects unsupported bit depth and alpha, normalizes EXIF orientation and embedded ICC profiles to sRGB, then reports RGB/luminance mean absolute error and per-pixel maximum-channel RGB P99/max error. The evidence is advisory, carries `delete_authorizing: false`, returns non-zero if any pair fails or is rejected, and is not accepted by mutation commands.
 - **Execution Freeze**: Resolves operations using identifiers frozen in the manifest; search/filter routines are never rerun at execution time.
 - **Deletions**: Require interactive TTY confirmation and a single-use HMAC token.
 - **Preconditions**: Precondition failures abort the batch before calling native helper mutations.

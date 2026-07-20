@@ -17,6 +17,7 @@ from apple_photos_cli.cli import build_parser
         ["asset", "retrieve"],
         ["metadata", "dump"],
         ["metadata", "backup"],
+        ["evidence", "compare-images"],
         ["import", "plan"],
         ["import", "apply"],
         ["import-batch", "plan"],

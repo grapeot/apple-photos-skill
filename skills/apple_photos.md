@@ -51,6 +51,7 @@ A task is complete only when all criteria hold:
 - **Backups**: Use `metadata dump` for stream snapshots and `metadata backup` for checksummed archives (not media files).
 - **File Retrieval**: Retrieve original resources using `asset retrieve` (requires network opt-in for iCloud assets).
 - **Identifier Mapping**: Discovery uses osxphotos UUIDs. Retrieve PhotoKit local identifiers using `asset mutation-list` or `album mutation-list` prior to mutation.
+- **Pixel Evidence**: Use `evidence compare-images` for read-only comparison of frozen local image pairs. Passing thresholds are advisory only; the report always sets `delete_authorizing` to `false` and cannot replace complete resource-set SHA-256 equality.
 
 ### Mutations
 - **Planning**: Generates side-effect-free plans for review.
