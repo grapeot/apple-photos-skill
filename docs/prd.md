@@ -10,6 +10,7 @@
 - Lexically search, list, and filter normalized metadata.
 - Export streaming metadata dumps and checksummed metadata backups.
 - Retrieve original asset resources verified by SHA-256.
+- Compare frozen local image pairs with deterministic pixel-error metrics for read-only review evidence. Similarity reports must be cryptographically bound to their input manifest and must never authorize deletion.
 - Plan and apply single-resource imports with exact duplicate checks.
 - Plan, authorize, and execute deletions (moving items to Recently Deleted).
 
@@ -43,7 +44,7 @@
 - Interacting with or targeting non-System Photo Libraries.
 - Automating or bypassing macOS TCC/PhotoKit delete confirmation prompts.
 - Permanent deletion or emptying Recently Deleted.
-- Perceptual duplicate detection or visual similarity matching.
+- Using perceptual or pixel similarity as exact-duplicate proof or deletion authorization.
 - Importing compound resources (Live Photos, RAW+JPEG, bursts, edited pairs, Shared Albums).
 - Restoring metadata backups to Apple Photos.
 - Replacing system backup solutions.

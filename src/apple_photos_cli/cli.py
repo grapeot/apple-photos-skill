@@ -18,6 +18,7 @@ from apple_photos_cli.authorization import AuthorizationService
 from apple_photos_cli.contracts import render_json, render_jsonl
 from apple_photos_cli.errors import EXIT_PARTIAL, ApplePhotosError, usage_error
 from apple_photos_cli.manifests import format_time, load_manifest
+from apple_photos_cli.similarity import SimilarityPolicy, compare_image_manifest
 from apple_photos_cli.state import ReplayStore, default_state_dir, ensure_state_dir
 
 
@@ -121,6 +122,17 @@ def build_parser() -> argparse.ArgumentParser:
     backup = metadata_commands.add_parser("backup", help="Create an atomic metadata backup bundle")
     backup.add_argument("--library", type=Path)
     backup.add_argument("--output", type=Path, required=True)
+
+    evidence = commands.add_parser("evidence", help="Build read-only comparison evidence")
+    evidence_commands = evidence.add_subparsers(dest="evidence_command", required=True)
+    compare = evidence_commands.add_parser(
+        "compare-images", help="Compare frozen image pairs using deterministic pixel metrics"
+    )
+    compare.add_argument("--input-manifest", type=Path, required=True)
+    compare.add_argument("--output", type=Path, required=True)
+    compare.add_argument("--max-rgb-mae", type=float, default=0.01)
+    compare.add_argument("--max-luma-mae", type=float, default=0.01)
+    compare.add_argument("--max-rgb-p99", type=float, default=0.05)
 
     import_group = commands.add_parser("import", help="Plan or apply one-resource imports")
     import_commands = import_group.add_subparsers(dest="import_command", required=True)
@@ -427,6 +439,29 @@ def run(args: argparse.Namespace, *, stdin: TextIO = sys.stdin, stderr: TextIO =
                 items.append(value)
         _emit_items(args, f"asset.{args.asset_command}", "asset", items)
         return 0
+    if args.command == "evidence":
+        policy = SimilarityPolicy(
+            max_rgb_mae=args.max_rgb_mae,
+            max_luma_mae=args.max_luma_mae,
+            max_rgb_p99=args.max_rgb_p99,
+        )
+        report = compare_image_manifest(args.input_manifest, args.output, policy)
+        gate_passed = report["gate_passed"]
+        render_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "command": "evidence.compare-images",
+                "ok": gate_passed,
+                "status": "succeeded" if gate_passed else "partial",
+                "counts": report["counts"],
+                "artifacts": {"report": str(args.output.resolve())},
+                "warnings": [
+                    "Pixel similarity evidence is non-authorizing and cannot approve deletion."
+                ],
+            },
+            sys.stdout,
+        )
+        return 0 if gate_passed else EXIT_PARTIAL
     if args.command == "metadata":
         app = _application(args, reader=True)
         if args.metadata_command == "dump":

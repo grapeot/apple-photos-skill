@@ -1,5 +1,7 @@
 # Apple Photos Skill
 
+[![CI](https://github.com/grapeot/apple-photos-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/grapeot/apple-photos-skill/actions/workflows/ci.yml)
+
 `apple-photos` is a live-unverified alpha. Offline contracts and synthetic mutation paths are tested, but live import and delete operations are unvalidated against real System Photo Libraries. Do not run mutation commands on production libraries.
 
 The Python 3.11+ CLI uses `osxphotos==0.76.1` exclusively for read-only metadata access. Mutations execute via a native Swift PhotoKit helper targeting the System Photo Library only, without writing to the Photos SQLite database. Uncertain post-dispatch outcomes are journaled as `outcome_unknown` rather than reported as safe-to-retry failures.
@@ -47,6 +49,7 @@ The native helper requires macOS Photos read/write authorization. The Python pro
 - **Authorization**: Deletes require interactive TTY input of `DELETE <count> <digest-prefix>` to generate a 15-minute manifest-bound HMAC token, which is consumed in a local ledger before executing helper mutations.
 - **Isolation**: The HMAC token prevents local plan substitution; it is not a boundary against same-user processes. macOS TCC and PhotoKit confirmation dialogs enforce system-level boundaries.
 - **Namespaces**: `osxphotos_uuid` and `osxphotos_album_uuid` (reads) are distinct from `photokit_local_identifier` (mutations). Resolve mutation identifiers via `apple-photos asset mutation-list` and `apple-photos album mutation-list`.
+- **Pixel Evidence**: `evidence compare-images` compares frozen local image pairs after EXIF orientation and sRGB normalization. Its reports always set `delete_authorizing` to `false`; passing similarity thresholds never proves an exact duplicate and cannot authorize deletion.
 
 ## Read Examples
 
@@ -66,6 +69,26 @@ apple-photos metadata backup --library ./Example.photoslibrary --output ./metada
 ```
 
 `metadata backup` generates a checksummed metadata snapshot, not a media file or `.photoslibrary` directory backup.
+
+## Read-Only Pixel Evidence
+
+Create a JSONL pair manifest:
+
+```json
+{"pair_id":"pair-0001","left":"./candidate.png","right":"./keeper.jpg"}
+```
+
+Run the default conservative comparison gate:
+
+```bash
+apple-photos evidence compare-images \
+  --input-manifest ./pairs.jsonl \
+  --output ./pixel-evidence.json
+```
+
+The default policy requires equal dimensions, RGB mean absolute error at or below 1%, per-pixel luminance mean absolute error at or below 1%, and the 99th percentile of each pixel's maximum RGB-channel error at or below 5%. Global average brightness alone is intentionally insufficient because unrelated images can share the same average brightness. High-bit-depth or unverifiable-bit-depth images, non-opaque alpha, animated images, multi-frame images, videos, oversized inputs, decode failures, and invalid ICC profiles fail closed. Any failed or rejected pair makes the command return exit code `8` after writing the complete report.
+
+This command only produces review evidence. It is not connected to `delete plan`, `delete authorize`, or `delete apply`, and its output schema requires `delete_authorizing: false`.
 
 ## Mutation Planning
 

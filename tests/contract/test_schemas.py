@@ -6,10 +6,12 @@ from pathlib import Path
 
 from conftest import FIXED_TIME
 from jsonschema import Draft202012Validator
+from PIL import Image
 
 from apple_photos_cli.authorization import AuthorizationService, load_token
 from apple_photos_cli.contracts import render_jsonl
 from apple_photos_cli.manifests import format_time
+from apple_photos_cli.similarity import SimilarityPolicy, compare_image_manifest
 
 
 def _schema(name: str) -> dict:
@@ -78,3 +80,18 @@ def test_every_jsonl_record_validates() -> None:
     assert records[-1]["record_type"] == "run_end"
     for record in records:
         _assert_valid("event-v1.schema.json", record)
+
+
+def test_pixel_similarity_report_schema(tmp_path: Path) -> None:
+    left = tmp_path / "left.png"
+    right = tmp_path / "right.png"
+    Image.new("RGB", (2, 2), (10, 20, 30)).save(left)
+    Image.new("RGB", (2, 2), (10, 20, 30)).save(right)
+    pairs = tmp_path / "pairs.jsonl"
+    pairs.write_text(
+        json.dumps({"pair_id": "pair-1", "left": str(left), "right": str(right)}) + "\n"
+    )
+
+    report = compare_image_manifest(pairs, tmp_path / "report.json", SimilarityPolicy())
+
+    _assert_valid("pixel-similarity-report-v1.schema.json", report)
