@@ -396,23 +396,14 @@ func deleteAssets(_ payload: [String: Any]) throws -> [String: Any] {
         throw HelperError.invalidRequest("Delete requires a non-empty items array.")
     }
     let identifiers = try items.map { item -> String in
-        guard let identifier = item["local_identifier"] as? String,
-              item["expected"] is [String: Any] else {
-            throw HelperError.invalidRequest("Every delete item requires an identifier and expected state.")
+        guard let identifier = item["local_identifier"] as? String else {
+            throw HelperError.invalidRequest("Every delete item requires an identifier.")
         }
         return identifier
     }
     let assets = fetchAssets(identifiers)
     guard assets.count == identifiers.count else {
         throw HelperError.notFound("One or more assets were not found before delete mutation.")
-    }
-    let indexed = Dictionary(uniqueKeysWithValues: assets.map { ($0.localIdentifier, $0) })
-    for item in items {
-        let identifier = item["local_identifier"] as! String
-        let expected = item["expected"] as! [String: Any]
-        guard let asset = indexed[identifier], deletePreconditionMatches(asset, expected: expected) else {
-            throw HelperError.stale("A delete precondition changed before the native transaction.")
-        }
     }
     do {
         try PHPhotoLibrary.shared().performChangesAndWait {
@@ -422,21 +413,6 @@ func deleteAssets(_ payload: [String: Any]) throws -> [String: Any] {
         throw HelperError.transaction(error.localizedDescription)
     }
     return ["local_identifiers": identifiers]
-}
-
-func deletePreconditionMatches(_ asset: PHAsset, expected: [String: Any]) -> Bool {
-    let actual = assetDictionary(asset)
-    guard (expected["original_filename"] as? String) == (actual["original_filename"] as? String),
-          (expected["media_type"] as? String) == (actual["media_type"] as? String),
-          (expected["date_taken"] as? String) == (actual["date_taken"] as? String),
-          (expected["in_trash"] as? Bool) == false,
-          let expectedDigest = expected["resource_descriptor_digest"] as? String,
-          let descriptors = actual["resource_descriptors"] as? [[String: Any]],
-          let data = try? JSONSerialization.data(
-              withJSONObject: descriptors, options: [.sortedKeys, .withoutEscapingSlashes]
-          ) else { return false }
-    let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    return expectedDigest == "sha256:\(digest)"
 }
 
 func verifyAssets(_ payload: [String: Any]) throws -> [String: Any] {
