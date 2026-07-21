@@ -21,6 +21,7 @@ Use `apple-photos` for read-only inspection. Mutation operations are restricted 
 - **Deduplication**: Enforce complete SHA-256 resource equality. Filenames, sizes, visual matches, or metadata fingerprints do not prove duplicate status.
 - **Manifests**: Execution requires deterministic JSON integrity-checksummed frozen manifests.
 - **Deletions**: Move assets to Recently Deleted only (no permanent erasure). Require interactive TTY confirmation phrase and a short-lived, single-use, manifest-bound HMAC token. Never bypass macOS delete confirmation prompts.
+- **AI Agent Authorization Guard**: The `delete authorize` prompt prints an explicit instruction telling AI agents to STOP and obtain the most recent and explicit human authorization via a question tool or conversation before entering the confirmation phrase. AI agents must not pipe or PTY-inject the phrase without first receiving a clear, explicit, and current human confirmation. This guard is printed on every authorize prompt and must not be suppressed or skipped.
 - **Error Handling**: Treat `partial` or `outcome_unknown` states as transaction failures. Reconcile read-only; never auto-retry.
 
 ## Acceptance Criteria
@@ -57,7 +58,7 @@ A task is complete only when all criteria hold:
 - **Planning**: Generates side-effect-free plans for review.
 - **Imports**: Limited to single-resource images and videos only; compound assets fail closed.
 - **Import Uncertainty**: Uses ordered per-item PhotoKit transactions. Stop at the first unknown outcome, preserve earlier identifiers, record every remaining item as `not_attempted_after_unknown`, reconcile read-only, and never auto-retry.
-- **Deletions**: Require interactive confirmation inputs and one-time authorization tokens. Piping confirmation or reusing tokens is prohibited.
+- **Deletions**: Require interactive confirmation inputs and one-time authorization tokens. Piping confirmation, PTY-injecting the phrase, or reusing tokens is prohibited. AI agents must stop at the authorization prompt and obtain explicit human confirmation before proceeding.
 
 ## Known Limitations and Failure Modes
 
@@ -69,6 +70,10 @@ A task is complete only when all criteria hold:
 - Multiple exact duplicate matches block execution rather than resolving arbitrarily.
 - Concurrency shifts by external apps bypass advisory locks; live pre- and post-conditions remain mandatory.
 - Helper transaction failures after dispatch report per-item evidence as `partial` or `outcome_unknown`. Receipts preserve earlier known identifiers, distinguish later `not_attempted_after_unknown` items, and must be reconciled read-only.
+- **Batch delete timeout**: Large batch deletes (hundreds or thousands of assets) may cause the PhotoKit helper to time out after dispatching mutations. The CLI reports `outcome_unknown` for all items, but some or all assets may have actually been moved to Recently Deleted. Always reconcile with a fresh read after `outcome_unknown`; never assume the operation failed or succeeded based solely on the helper response.
+- **PhotoKit permission**: If `doctor --capability mutation` reports `E_PERMISSION_PHOTOS` (status=2), the PhotoKit helper process has not been granted Photos access by macOS TCC. On non-GUI processes, macOS may not prompt automatically. Resetting Photos TCC state with `tccutil reset Photos` may trigger a fresh authorization dialog on the next PhotoKit call, but this is not guaranteed if denial is caused by process identity, code signing, or configuration. Consult macOS System Settings > Privacy & Security > Photos if the dialog does not appear.
+- **Identifier mapping**: osxphotos UUIDs and PhotoKit local identifiers are separate namespaces. Use `asset mutation-list` to retrieve authoritative PhotoKit local identifiers for mutation. In some Photos library versions, the PhotoKit local identifier may share the same base UUID as the osxphotos UUID with a resource suffix appended (e.g., `/L0/001`), but this format is not guaranteed across all library versions or asset types. Always verify any constructed identifier exists in live PhotoKit output before using it in a deletion manifest.
+- **date_taken contamination**: Imports from tools like `photos-import` may write the import timestamp into `date_taken` instead of the original capture time. osxphotos reports the contaminated value, while PhotoKit may report the correct UTC time. Do not use `date_taken` as identity evidence for duplicate detection or deletion candidate selection.
 
 ## Reporting
 
