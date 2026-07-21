@@ -15,7 +15,8 @@ from typing import Any
 from PIL import Image, ImageChops, ImageCms, ImageOps
 
 from apple_photos_cli.canonical import sha256_digest
-from apple_photos_cli.errors import usage_error
+from apple_photos_cli.errors import stale, usage_error
+from apple_photos_cli.manifests import validate_schema
 from apple_photos_cli.models import SCHEMA_VERSION
 
 MAX_INPUT_BYTES = 1024 * 1024 * 1024
@@ -44,6 +45,13 @@ class SimilarityPolicy:
             "max_luma_mae": self.max_luma_mae,
             "max_rgb_p99": self.max_rgb_p99,
         }
+
+    def delete_eligible(self) -> bool:
+        return (
+            self.max_rgb_mae <= 0.01
+            and self.max_luma_mae <= 0.01
+            and self.max_rgb_p99 <= 0.05
+        )
 
 
 def _read_frozen_bytes(path: Path, *, label: str) -> bytes:
@@ -187,6 +195,7 @@ def compare_images(left: Path, right: Path, policy: SimilarityPolicy) -> dict[st
     policy.validate()
     left_bytes = _read_frozen_bytes(left, label="left input")
     right_bytes = _read_frozen_bytes(right, label="right input")
+    byte_identical = left_bytes == right_bytes
     left_image, left_decode = _normalized_rgb(
         left_bytes, media_type=mimetypes.guess_type(left.name)[0], label="left input"
     )
@@ -199,6 +208,7 @@ def compare_images(left: Path, right: Path, policy: SimilarityPolicy) -> dict[st
             if not dimensions_equal:
                 return {
                     "passed": False,
+                    "byte_identical": byte_identical,
                     "dimensions_equal": False,
                     "left": {"sha256": _sha256_bytes(left_bytes), "decode": left_decode},
                     "right": {"sha256": _sha256_bytes(right_bytes), "decode": right_decode},
@@ -273,6 +283,7 @@ def compare_images(left: Path, right: Path, policy: SimilarityPolicy) -> dict[st
     ]
     return {
         "passed": not failed_checks,
+        "byte_identical": byte_identical,
         "dimensions_equal": True,
         "left": {"sha256": _sha256_bytes(left_bytes), "decode": left_decode},
         "right": {"sha256": _sha256_bytes(right_bytes), "decode": right_decode},
@@ -299,7 +310,12 @@ def load_pair_manifest(path: Path, *, frozen_bytes: bytes | None = None) -> list
             pair_id = value["pair_id"]
             left = value["left"]
             right = value["right"]
-            if not all(isinstance(item, str) and item for item in (pair_id, left, right)):
+            candidate = value["candidate_local_identifier"]
+            keeper = value["keeper_local_identifier"]
+            if not all(
+                isinstance(item, str) and item
+                for item in (pair_id, left, right, candidate, keeper)
+            ):
                 raise TypeError
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise usage_error(
@@ -308,7 +324,25 @@ def load_pair_manifest(path: Path, *, frozen_bytes: bytes | None = None) -> list
         if pair_id in seen_ids:
             raise usage_error(f"Duplicate pair_id on line {number}.", code="E_SCHEMA_INVALID")
         seen_ids.add(pair_id)
-        pairs.append({"pair_id": pair_id, "left": Path(left), "right": Path(right)})
+        if candidate == keeper:
+            raise usage_error(
+                f"Pair candidate and keeper must differ on line {number}.",
+                code="E_SCHEMA_INVALID",
+            )
+        pairs.append(
+            {
+                "pair_id": pair_id,
+                "left": Path(left),
+                "right": Path(right),
+                "candidate_local_identifier": candidate,
+                "keeper_local_identifier": keeper,
+            }
+        )
+        if len(pairs) > 50:
+            raise usage_error(
+                "Pixel evidence is limited to 50 pairs per report.",
+                code="E_DELETE_BATCH_TOO_LARGE",
+            )
     if not pairs:
         raise usage_error("Pair manifest must contain at least one record.")
     return pairs
@@ -323,7 +357,13 @@ def compare_image_manifest(
     for pair in load_pair_manifest(manifest_path, frozen_bytes=manifest_bytes):
         try:
             comparison = compare_images(pair["left"], pair["right"], policy)
-            item = {"pair_id": pair["pair_id"], "status": "compared", **comparison}
+            item = {
+                "pair_id": pair["pair_id"],
+                "candidate_local_identifier": pair["candidate_local_identifier"],
+                "keeper_local_identifier": pair["keeper_local_identifier"],
+                "status": "compared",
+                **comparison,
+            }
         except Exception as exc:
             from apple_photos_cli.errors import ApplePhotosError
 
@@ -331,6 +371,8 @@ def compare_image_manifest(
                 raise
             item = {
                 "pair_id": pair["pair_id"],
+                "candidate_local_identifier": pair["candidate_local_identifier"],
+                "keeper_local_identifier": pair["keeper_local_identifier"],
                 "status": "rejected",
                 "passed": False,
                 "error": exc.to_dict(),
@@ -340,12 +382,16 @@ def compare_image_manifest(
     compared = sum(item["status"] == "compared" for item in items)
     passed = sum(item["status"] == "compared" and item["passed"] for item in items)
     rejected = sum(item["status"] == "rejected" for item in items)
+    byte_identical = sum(
+        item["status"] == "compared" and item["byte_identical"] for item in items
+    )
+    gate_passed = passed == len(items)
     report = {
         "schema_version": SCHEMA_VERSION,
         "report_type": "apple_photos_pixel_similarity",
         "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        "mode": "read_only_evidence",
-        "delete_authorizing": False,
+        "mode": "pixel_similarity_delete_evidence",
+        "delete_authorizing": gate_passed and byte_identical == 0 and policy.delete_eligible(),
         "source_manifest_sha256": _sha256_bytes(manifest_bytes),
         "policy": policy.to_dict(),
         "counts": {
@@ -354,11 +400,114 @@ def compare_image_manifest(
             "passed": passed,
             "failed": compared - passed,
             "rejected": rejected,
+            "byte_identical": byte_identical,
         },
-        "gate_passed": passed == len(items),
+        "gate_passed": gate_passed,
         "items": items,
     }
     report["report_sha256"] = sha256_digest(report)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report
+
+
+def load_similarity_report(path: Path) -> dict[str, Any]:
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise usage_error(
+            "Cannot read pixel similarity report.", code="E_SIMILARITY_READ_FAILED"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise usage_error(
+            "Pixel similarity report is not valid JSON.", code="E_SCHEMA_INVALID"
+        ) from exc
+    if not isinstance(report, dict):
+        raise usage_error(
+            "Pixel similarity report root must be an object.", code="E_SCHEMA_INVALID"
+        )
+    validate_schema(report, "pixel-similarity-report-v1.schema.json")
+    sealed = dict(report)
+    observed_digest = sealed.pop("report_sha256")
+    if sha256_digest(sealed) != observed_digest:
+        raise stale(
+            "Pixel similarity report digest does not match its contents.",
+            code="E_MANIFEST_TAMPERED",
+        )
+    items = report["items"]
+    pair_ids = [item["pair_id"] for item in items]
+    candidates = [item["candidate_local_identifier"] for item in items]
+    keepers = {item["keeper_local_identifier"] for item in items}
+    if len(pair_ids) != len(set(pair_ids)) or len(candidates) != len(set(candidates)):
+        raise usage_error(
+            "Pixel report pair and candidate identifiers must be unique.",
+            code="E_SCHEMA_INVALID",
+        )
+    if set(candidates) & keepers:
+        raise usage_error("A delete candidate cannot also be a keeper.", code="E_SCHEMA_INVALID")
+    compared = sum(item["status"] == "compared" for item in items)
+    passed = sum(item["status"] == "compared" and item["passed"] for item in items)
+    rejected = sum(item["status"] == "rejected" for item in items)
+    byte_identical = sum(
+        item["status"] == "compared" and item["byte_identical"] for item in items
+    )
+    expected_counts = {
+        "total": len(items),
+        "compared": compared,
+        "passed": passed,
+        "failed": compared - passed,
+        "rejected": rejected,
+        "byte_identical": byte_identical,
+    }
+    if report["counts"] != expected_counts:
+        raise usage_error("Pixel report counts are inconsistent.", code="E_SCHEMA_INVALID")
+    gate_passed = passed == len(items)
+    policy = SimilarityPolicy(**report["policy"])
+    policy.validate()
+    delete_authorizing = gate_passed and byte_identical == 0 and policy.delete_eligible()
+    if report["gate_passed"] != gate_passed or report["delete_authorizing"] != delete_authorizing:
+        raise usage_error(
+            "Pixel report authorization state is inconsistent.", code="E_SCHEMA_INVALID"
+        )
+    return report
+
+
+def revalidate_similarity_report(report: dict[str, Any], pair_manifest: Path) -> None:
+    manifest_bytes = _read_frozen_bytes(pair_manifest, label="pair manifest")
+    if _sha256_bytes(manifest_bytes) != report["source_manifest_sha256"]:
+        raise stale(
+            "Pixel pair manifest digest does not match the report.",
+            code="E_MANIFEST_TAMPERED",
+        )
+    pairs = load_pair_manifest(pair_manifest, frozen_bytes=manifest_bytes)
+    if len(pairs) != len(report["items"]):
+        raise stale("Pixel pair set changed after comparison.", code="E_PIXEL_EVIDENCE_STALE")
+    policy = SimilarityPolicy(**report["policy"])
+    for pair, item in zip(pairs, report["items"], strict=True):
+        identity = {
+            "pair_id": pair["pair_id"],
+            "candidate_local_identifier": pair["candidate_local_identifier"],
+            "keeper_local_identifier": pair["keeper_local_identifier"],
+        }
+        if any(item.get(key) != value for key, value in identity.items()):
+            raise stale(
+                "Pixel pair identity changed after comparison.",
+                code="E_PIXEL_EVIDENCE_STALE",
+            )
+        try:
+            comparison = compare_images(pair["left"], pair["right"], policy)
+        except Exception as exc:
+            from apple_photos_cli.errors import ApplePhotosError
+
+            if not isinstance(exc, ApplePhotosError):
+                raise
+            raise stale(
+                f"Pixel pair can no longer be verified: {pair['pair_id']}.",
+                code="E_PIXEL_EVIDENCE_STALE",
+            ) from exc
+        expected = {**identity, "status": "compared", **comparison}
+        if item != expected:
+            raise stale(
+                f"Pixel comparison changed for {pair['pair_id']}.",
+                code="E_PIXEL_EVIDENCE_STALE",
+            )

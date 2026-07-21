@@ -61,7 +61,7 @@ class PhotoKitProcessBridge:
                 text=True,
                 capture_output=True,
                 check=False,
-                timeout=self.timeout,
+                timeout=None if operation == "delete-assets" else self.timeout,
                 env=allowed_environment,
             )
         except subprocess.TimeoutExpired as exc:
@@ -80,7 +80,11 @@ class PhotoKitProcessBridge:
                 "E_BACKEND_PROTOCOL",
                 "PhotoKit helper could not be started.",
                 EXIT_IO,
-                {"operation": operation, "os_error": str(exc)},
+                {
+                    "operation": operation,
+                    "os_error": str(exc),
+                    **({"mutation_phase": "not_started"} if mutation else {}),
+                },
             ) from exc
         if completed.returncode != 0:
             raise ApplePhotosError(
@@ -139,8 +143,41 @@ class PhotoKitProcessBridge:
                 )
             code = error.get("code", "E_BACKEND_TRANSACTION")
             message = error.get("message", "PhotoKit helper reported an error.")
+            detail = error.get("detail")
+            if (
+                not isinstance(code, str)
+                or not isinstance(message, str)
+                or (detail is not None and not isinstance(detail, dict))
+            ):
+                raise ApplePhotosError(
+                    "E_OUTCOME_UNKNOWN" if mutation else "E_BACKEND_PROTOCOL",
+                    "PhotoKit helper error envelope has malformed fields.",
+                    EXIT_PARTIAL if mutation else EXIT_IO,
+                )
+            if mutation:
+                known_precommit_codes = {
+                    "E_BACKEND_PROTOCOL",
+                    "E_PERMISSION_PHOTOS",
+                    "E_NOT_FOUND",
+                    "E_RESOURCE_UNAVAILABLE",
+                    "E_PLAN_STALE",
+                    "E_AUTH_EXPIRED",
+                    "E_AUTH_REPLAY",
+                }
+                phase = detail.get("mutation_phase") if isinstance(detail, dict) else None
+                valid_phase = phase in {"not_started", "commit_attempted"}
+                phase_matches_code = not (
+                    (code == "E_BACKEND_TRANSACTION" and phase != "commit_attempted")
+                    or (code in known_precommit_codes and phase != "not_started")
+                )
+                if not valid_phase or not phase_matches_code:
+                    raise ApplePhotosError(
+                        "E_OUTCOME_UNKNOWN",
+                        "PhotoKit helper mutation phase is malformed or contradictory.",
+                        EXIT_PARTIAL,
+                    )
             exit_code = EXIT_BACKEND if code == "E_BACKEND_TRANSACTION" else EXIT_IO
-            raise ApplePhotosError(code, message, exit_code, error.get("detail"))
+            raise ApplePhotosError(code, message, exit_code, detail)
         if "result" not in response:
             raise ApplePhotosError(
                 "E_OUTCOME_UNKNOWN" if mutation else "E_BACKEND_PROTOCOL",
@@ -286,6 +323,9 @@ class PhotoKitProcessBridge:
                     "transaction_outcome_unknown",
                 }
             ) or (
+                item_status == "not_attempted"
+                and evidence in {"transaction_not_started", "not_attempted"}
+            ) or (
                 item_status == "not_attempted_after_unknown"
                 and evidence == "not_attempted_after_unknown"
             )
@@ -296,6 +336,7 @@ class PhotoKitProcessBridge:
                 in {
                     "created_identifier_known",
                     "outcome_unknown",
+                    "not_attempted",
                     "not_attempted_after_unknown",
                 }
                 and isinstance(evidence, str)
@@ -308,7 +349,8 @@ class PhotoKitProcessBridge:
                         and bool(identifier)
                     )
                     or (
-                        item_status in {"outcome_unknown", "not_attempted_after_unknown"}
+                        item_status
+                        in {"outcome_unknown", "not_attempted", "not_attempted_after_unknown"}
                         and identifier is None
                     )
                 )
@@ -337,26 +379,40 @@ class PhotoKitProcessBridge:
                 "Import result did not acknowledge the requested item sequence.",
                 EXIT_PARTIAL,
             )
-        stopped = False
+        stop_kind: str | None = None
         for item in normalized:
-            if stopped and item["status"] != "not_attempted_after_unknown":
+            if stop_kind == "unknown" and item["status"] != "not_attempted_after_unknown":
                 raise ApplePhotosError(
                     "E_OUTCOME_UNKNOWN",
                     "Import result continued after an uncertain item.",
                     EXIT_PARTIAL,
                 )
-            if item["status"] == "not_attempted_after_unknown" and not stopped:
+            if stop_kind == "known" and item["status"] != "not_attempted":
+                raise ApplePhotosError(
+                    "E_OUTCOME_UNKNOWN",
+                    "Import result continued after a known precommit rejection.",
+                    EXIT_PARTIAL,
+                )
+            if item["status"] == "not_attempted_after_unknown" and stop_kind != "unknown":
                 raise ApplePhotosError(
                     "E_OUTCOME_UNKNOWN",
                     "Import result marked an item not attempted before any uncertainty.",
                     EXIT_PARTIAL,
                 )
             if item["status"] == "outcome_unknown":
-                stopped = True
+                stop_kind = "unknown"
+            if item["status"] == "not_attempted":
+                stop_kind = "known"
         known = sum(item["status"] == "created_identifier_known" for item in normalized)
-        unknown = len(normalized) - known
+        unknown = sum(
+            item["status"] in {"outcome_unknown", "not_attempted_after_unknown"}
+            for item in normalized
+        )
+        not_attempted = sum(item["status"] == "not_attempted" for item in normalized)
         expected_status = (
-            "succeeded" if unknown == 0 else ("outcome_unknown" if known == 0 else "partial")
+            ("outcome_unknown" if known == 0 else "partial")
+            if unknown
+            else ("partial" if not_attempted else "succeeded")
         )
         if status != expected_status:
             raise ApplePhotosError(
@@ -372,9 +428,45 @@ class PhotoKitProcessBridge:
             {"local_identifiers": list(local_identifiers), "album_id": album_id},
         )
 
-    def delete_assets(self, items: Sequence[dict[str, Any]]) -> dict[str, Any]:
-        result = self._request("delete-assets", {"items": list(items)})
-        return self._object(result, "delete-assets", mutation_ambiguity=True)
+    def delete_assets(
+        self,
+        items: Sequence[dict[str, Any]],
+        *,
+        authorization_expires_at: str,
+        manifest_sha256: str,
+        evidence_attestation: dict[str, Any],
+        authorization_token: dict[str, Any],
+        network_access_allowed: bool = False,
+    ) -> dict[str, Any]:
+        result = self._request(
+            "delete-assets",
+            {
+                "items": list(items),
+                "authorization_expires_at": authorization_expires_at,
+                "manifest_sha256": manifest_sha256,
+                "evidence_attestation": evidence_attestation,
+                "authorization_token": authorization_token,
+                "network_access_allowed": network_access_allowed,
+            },
+        )
+        value = self._object(result, "delete-assets", mutation_ambiguity=True)
+        identifiers = value.get("local_identifiers")
+        if not isinstance(identifiers, list) or not all(
+            isinstance(identifier, str) for identifier in identifiers
+        ):
+            raise ApplePhotosError(
+                "E_OUTCOME_UNKNOWN",
+                "PhotoKit delete-assets result requires string local_identifiers.",
+                EXIT_PARTIAL,
+            )
+        requested = [item.get("local_identifier") for item in items]
+        if identifiers != requested:
+            raise ApplePhotosError(
+                "E_OUTCOME_UNKNOWN",
+                "PhotoKit delete acknowledgement does not match the request.",
+                EXIT_PARTIAL,
+            )
+        return value
 
     def verify_assets(
         self,
@@ -392,7 +484,14 @@ class PhotoKitProcessBridge:
             },
         )
         values = self._array(result, "assets", "verify-assets")
-        if not all(isinstance(item, dict) for item in values):
+        requested = list(local_identifiers)
+        if len(values) != len(requested) or any(
+            not isinstance(item, dict)
+            or item.get("local_identifier") != requested[index]
+            or not isinstance(item.get("present"), bool)
+            or not (item.get("in_album") is None or isinstance(item.get("in_album"), bool))
+            for index, item in enumerate(values)
+        ):
             raise ApplePhotosError(
                 "E_BACKEND_PROTOCOL", "Verification record is malformed.", EXIT_IO
             )

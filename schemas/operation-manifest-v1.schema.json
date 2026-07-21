@@ -20,8 +20,10 @@
     "library_snapshot_digest": {"$ref": "#/$defs/digest"},
     "target_album": {"$ref": "#/$defs/targetAlbum"},
     "duplicate_policy": {"$ref": "#/$defs/duplicatePolicy"},
+    "delete_policy": {"$ref": "#/$defs/deletePolicy"},
     "effect": {"const": "move_to_recently_deleted"},
     "items": {"type": "array", "minItems": 1},
+    "evidence_attestation": {"$ref": "#/$defs/evidenceAttestation"},
     "manifest_sha256": {"$ref": "#/$defs/digest"}
   },
   "allOf": [
@@ -30,14 +32,14 @@
       "then": {
         "required": ["target_album", "duplicate_policy"],
         "properties": {"items": {"items": {"$ref": "#/$defs/importItem"}}},
-        "not": {"required": ["effect"]}
+        "not": {"anyOf": [{"required": ["effect"]}, {"required": ["delete_policy"]}, {"required": ["evidence_attestation"]}]}
       }
     },
     {
       "if": {"properties": {"manifest_type": {"const": "apple_photos_delete"}}},
       "then": {
-        "required": ["effect"],
-        "properties": {"items": {"items": {"$ref": "#/$defs/deleteItem"}}},
+        "required": ["effect", "delete_policy", "evidence_attestation"],
+        "properties": {"items": {"maxItems": 50, "items": {"$ref": "#/$defs/deleteItem"}}},
         "not": {"anyOf": [{"required": ["target_album"]}, {"required": ["duplicate_policy"]}]}
       }
     }
@@ -81,6 +83,40 @@
       },
       "additionalProperties": false
     },
+    "deletePolicy": {
+      "type": "object",
+      "required": ["proof", "pure_byte_duplicates", "report_sha256", "source_manifest_sha256", "pair_manifest_path", "network_access_allowed", "policy"],
+      "properties": {
+        "proof": {"const": "pixel_similarity"},
+        "pure_byte_duplicates": {"const": "unsupported"},
+        "report_sha256": {"$ref": "#/$defs/digest"},
+        "source_manifest_sha256": {"$ref": "#/$defs/digest"},
+        "pair_manifest_path": {"type": "string", "minLength": 1},
+        "network_access_allowed": {"type": "boolean"},
+        "policy": {
+          "type": "object",
+          "required": ["max_rgb_mae", "max_luma_mae", "max_rgb_p99"],
+          "properties": {
+            "max_rgb_mae": {"type": "number", "minimum": 0, "maximum": 0.01},
+            "max_luma_mae": {"type": "number", "minimum": 0, "maximum": 0.01},
+            "max_rgb_p99": {"type": "number", "minimum": 0, "maximum": 0.05}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidenceAttestation": {
+      "type": "object",
+      "required": ["algorithm", "claims_sha256", "signed_claims", "signature"],
+      "properties": {
+        "algorithm": {"const": "hmac-sha256"},
+        "claims_sha256": {"$ref": "#/$defs/digest"},
+        "signed_claims": {"type": "string", "minLength": 1},
+        "signature": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
     "source": {
       "type": "object",
       "required": ["path", "byte_count", "sha256", "file_identity", "resource_role", "uti"],
@@ -115,23 +151,60 @@
     },
     "deleteItem": {
       "type": "object",
-      "required": ["item_id", "local_identifier", "expected", "planned_action"],
+      "required": ["item_id", "local_identifier", "expected", "pixel_similarity_proof", "planned_action"],
       "properties": {
         "item_id": {"type": "string", "pattern": "^del_[0-9]{6}$"},
         "local_identifier": {"type": "string", "minLength": 1},
         "planned_action": {"const": "move_to_recently_deleted"},
-        "expected": {
+        "expected": {"$ref": "#/$defs/deleteExpected"},
+        "pixel_similarity_proof": {
           "type": "object",
-          "required": ["original_filename", "media_type", "date_taken", "resource_descriptor_digest", "in_trash"],
+          "required": ["pair_id", "keeper_local_identifier", "keeper_expected", "candidate_source_sha256", "keeper_source_sha256", "bytes_different", "dimensions", "metrics"],
           "properties": {
-            "original_filename": {"type": ["string", "null"]},
-            "media_type": {"enum": ["image", "video", "audio", "unknown"]},
-            "date_taken": {"type": ["string", "null"]},
-            "resource_descriptor_digest": {"$ref": "#/$defs/digest"},
-            "in_trash": {"const": false}
+            "pair_id": {"type": "string", "minLength": 1},
+            "keeper_local_identifier": {"type": "string", "minLength": 1},
+            "keeper_expected": {"$ref": "#/$defs/deleteExpected"},
+            "candidate_source_sha256": {"$ref": "#/$defs/digest"},
+            "keeper_source_sha256": {"$ref": "#/$defs/digest"},
+            "bytes_different": {"const": true},
+            "dimensions": {
+              "type": "object",
+              "required": ["width", "height"],
+              "properties": {
+                "width": {"type": "integer", "minimum": 1},
+                "height": {"type": "integer", "minimum": 1}
+              },
+              "additionalProperties": false
+            },
+            "metrics": {
+              "type": "object",
+              "required": ["rgb_mean_absolute_error", "luma_mean_absolute_error", "rgb_p99_absolute_error", "rgb_max_absolute_error"],
+              "properties": {
+                "rgb_mean_absolute_error": {"type": "number", "minimum": 0, "maximum": 0.01},
+                "luma_mean_absolute_error": {"type": "number", "minimum": 0, "maximum": 0.01},
+                "rgb_p99_absolute_error": {"type": "number", "minimum": 0, "maximum": 0.05},
+                "rgb_max_absolute_error": {"type": "number", "minimum": 0, "maximum": 1}
+              },
+              "additionalProperties": false
+            }
           },
           "additionalProperties": false
         }
+      },
+      "additionalProperties": false
+    },
+    "deleteExpected": {
+      "type": "object",
+      "required": ["original_filename", "media_type", "date_taken", "date_modified", "width", "height", "resource_descriptor_digest", "in_trash"],
+      "properties": {
+        "original_filename": {"type": ["string", "null"]},
+        "media_type": {"const": "image"},
+        "date_taken": {"type": ["string", "null"]},
+        "date_modified": {"type": ["string", "null"]},
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "resource_descriptor_digest": {"$ref": "#/$defs/digest"},
+        "in_trash": {"const": false}
       },
       "additionalProperties": false
     }

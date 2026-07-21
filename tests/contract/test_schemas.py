@@ -4,7 +4,7 @@ import io
 import json
 from pathlib import Path
 
-from conftest import FIXED_TIME
+from conftest import FIXED_TIME, write_pixel_report
 from jsonschema import Draft202012Validator
 from PIL import Image
 
@@ -33,7 +33,8 @@ def test_asset_and_backup_schemas(app, fake_reader, tmp_path: Path) -> None:
 
 def test_operation_result_and_authorization_schemas(app, fake_bridge, tmp_path: Path) -> None:
     fake_bridge.add_asset("asset-delete", b"content")
-    manifest = app.plan_delete(["asset-delete"], output=tmp_path / "delete.json")
+    report, pairs = write_pixel_report(fake_bridge, tmp_path / "pixel.json", ["asset-delete"])
+    manifest = app.plan_delete(report, pairs, output=tmp_path / "delete.json")
     _assert_valid("operation-manifest-v1.schema.json", manifest)
 
     service = AuthorizationService(
@@ -89,7 +90,16 @@ def test_pixel_similarity_report_schema(tmp_path: Path) -> None:
     Image.new("RGB", (2, 2), (10, 20, 30)).save(right)
     pairs = tmp_path / "pairs.jsonl"
     pairs.write_text(
-        json.dumps({"pair_id": "pair-1", "left": str(left), "right": str(right)}) + "\n"
+        json.dumps(
+            {
+                "pair_id": "pair-1",
+                "left": str(left),
+                "right": str(right),
+                "candidate_local_identifier": "candidate-id",
+                "keeper_local_identifier": "keeper-id",
+            }
+        )
+        + "\n"
     )
 
     report = compare_image_manifest(pairs, tmp_path / "report.json", SimilarityPolicy())

@@ -10,7 +10,7 @@
 - Lexically search, list, and filter normalized metadata.
 - Export streaming metadata dumps and checksummed metadata backups.
 - Retrieve original asset resources verified by SHA-256.
-- Compare frozen local image pairs with deterministic pixel-error metrics for read-only review evidence. Similarity reports must be cryptographically bound to their input manifest and must never authorize deletion.
+- Compare frozen byte-different image pairs with deterministic pixel-error metrics and use fully passing reports as the sole supported delete-planning evidence.
 - Plan and apply single-resource imports with exact duplicate checks.
 - Plan, authorize, and execute deletions (moving items to Recently Deleted).
 
@@ -25,7 +25,10 @@
 - **Mutation Safety**:
   - All mutation commands default to dry-run planning.
   - Applying mutations requires a frozen manifest and `--apply`.
-  - Deletes require interactive TTY phrase confirmation (`DELETE <count> <digest-prefix>`) and a short-lived manifest-bound HMAC token.
+- Deletes require interactive TTY phrase confirmation (`DELETE <count> <digest-prefix>`) and a short-lived manifest-bound HMAC token.
+- Delete planning requires equal dimensions, RGB and luminance mean absolute error at or below 1%, and RGB P99 absolute error at or below 5%. Policies may be stricter but never weaker.
+- Source SHA-256 values bind compared files to candidate and keeper PhotoKit resources and protect evidence integrity. SHA-256 equality is not a deletion criterion.
+- Byte-identical duplicate deletion is explicitly unsupported.
   - Delete tokens expire in 15 minutes; the token nonce is consumed in a local SQLite ledger before native helper execution.
   - Revalidate the sorted PhotoKit asset-ID-set digest (snapshot) and preconditions before mutations. Snapshot equality does not prove physical library identity.
 
@@ -33,7 +36,7 @@
 
 - All offline unit, contract, and integration tests pass without active Photos or helper access.
 - Rejection of modified manifests, expired/replayed tokens, or mismatched snapshots prior to native helper execution.
-- Mandatory SHA-256 equality for duplicate detection.
+- Mandatory pixel-evidence replay, PhotoKit source ownership checks, and local HMAC planner attestation before delete authorization.
 - Every batch item returns terminal evidence. Import creation stops at the first unknown per-item transaction, preserves earlier successful identifiers, and marks every remaining item `not_attempted_after_unknown`; `partial` or `outcome_unknown` statuses return a non-zero exit code and block automatic retries.
 - Zero code paths write to the Photos SQLite database.
 - Complete exclusion of personal identifiers, media paths, or metadata from git-tracked files.
@@ -44,7 +47,7 @@
 - Interacting with or targeting non-System Photo Libraries.
 - Automating or bypassing macOS TCC/PhotoKit delete confirmation prompts.
 - Permanent deletion or emptying Recently Deleted.
-- Using perceptual or pixel similarity as exact-duplicate proof or deletion authorization.
+- Deleting byte-identical duplicates or treating SHA-256 equality as the supported deduplication workflow.
 - Importing compound resources (Live Photos, RAW+JPEG, bursts, edited pairs, Shared Albums).
 - Restoring metadata backups to Apple Photos.
 - Replacing system backup solutions.

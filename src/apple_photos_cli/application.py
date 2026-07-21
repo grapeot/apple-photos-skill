@@ -15,6 +15,7 @@ from apple_photos_cli.contracts import create_metadata_backup
 from apple_photos_cli.errors import (
     EXIT_AUTH,
     EXIT_IO,
+    EXIT_PARTIAL,
     ApplePhotosError,
     stale,
     unsupported,
@@ -30,6 +31,7 @@ from apple_photos_cli.hashing import (
 from apple_photos_cli.manifests import (
     atomic_write_json,
     format_time,
+    fsync_directory,
     load_manifest,
     validate_schema,
     write_manifest,
@@ -42,6 +44,7 @@ from apple_photos_cli.models import (
     PhotoKitAlbumRecord,
     ResourceRecord,
 )
+from apple_photos_cli.similarity import load_similarity_report, revalidate_similarity_report
 from apple_photos_cli.state import LibraryLock, ReplayStore
 
 
@@ -76,7 +79,16 @@ class Bridge(Protocol):
         self, local_identifiers: Sequence[str], album_id: str
     ) -> dict[str, Any]: ...
 
-    def delete_assets(self, items: Sequence[dict[str, Any]]) -> dict[str, Any]: ...
+    def delete_assets(
+        self,
+        items: Sequence[dict[str, Any]],
+        *,
+        authorization_expires_at: str,
+        manifest_sha256: str,
+        evidence_attestation: dict[str, Any],
+        authorization_token: dict[str, Any],
+        network_access_allowed: bool = False,
+    ) -> dict[str, Any]: ...
 
     def verify_assets(
         self,
@@ -395,6 +407,8 @@ class Application:
         item_results: list[dict[str, Any]] = []
         created_payload: list[dict[str, Any]] = []
         created_expected: dict[str, str] = {}
+        created_evidence: dict[str, dict[str, Any]] = {}
+        created_ids: dict[str, str] = {}
         reused: dict[str, str] = {}
         resolved: dict[str, str] = {}
         staging_root = self.state_dir / "staging"
@@ -429,13 +443,20 @@ class Application:
                     command="import.apply",
                     run_id=run_id,
                     ok=False,
-                    status="running",
+                    status="outcome_unknown",
                     started_at=started,
                     finished_at=self._time(),
                     phase="commit_pending",
                     manifest_sha256=manifest["manifest_sha256"],
                     library_snapshot={"kind": snapshot.kind, "snapshot_digest": snapshot.digest},
-                    counts={"planned": len(manifest["items"])},
+                    counts={
+                        "planned": len(manifest["items"]),
+                        "unknown": len(manifest["items"]),
+                    },
+                    items=[
+                        {"item_id": item["item_id"], "status": "outcome_unknown"}
+                        for item in manifest["items"]
+                    ],
                     artifacts={"manifest": str(manifest_path.resolve())},
                 )
                 self._write_receipt(pending)
@@ -466,7 +487,7 @@ class Application:
                     }
                     for item_id, item in created_evidence.items()
                     if item["status"]
-                    in {"outcome_unknown", "not_attempted_after_unknown"}
+                    in {"outcome_unknown", "not_attempted", "not_attempted_after_unknown"}
                 }
                 resolved.update(created_ids)
                 for item in manifest["items"]:
@@ -484,6 +505,11 @@ class Application:
                                     "evidence": (
                                         "batch_duplicate_parent_not_attempted_after_unknown"
                                     ),
+                                }
+                            elif parent_status == "not_attempted":
+                                terminal_evidence[item["item_id"]] = {
+                                    "status": "not_attempted",
+                                    "evidence": "batch_duplicate_parent_not_attempted",
                                 }
                             else:
                                 terminal_evidence[item["item_id"]] = {
@@ -524,14 +550,16 @@ class Application:
                 pending.finished_at = self._time()
                 self._write_receipt(pending)
                 if terminal_evidence:
-                    terminal_status = "partial" if resolved else "outcome_unknown"
                     unknown_count = sum(
                         item["status"] == "outcome_unknown"
                         for item in terminal_evidence.values()
                     )
                     not_attempted_count = sum(
-                        item["status"] == "not_attempted_after_unknown"
+                        item["status"] in {"not_attempted", "not_attempted_after_unknown"}
                         for item in terminal_evidence.values()
+                    )
+                    terminal_status = (
+                        "outcome_unknown" if unknown_count and not resolved else "partial"
                     )
                     result = OperationResult(
                         command="import.apply",
@@ -556,10 +584,18 @@ class Application:
                         artifacts={"manifest": str(manifest_path.resolve())},
                         errors=[
                             {
-                                "code": "E_OUTCOME_UNKNOWN",
+                                "code": (
+                                    "E_OUTCOME_UNKNOWN"
+                                    if unknown_count
+                                    else "E_BACKEND_TRANSACTION"
+                                ),
                                 "message": (
-                                    "PhotoKit stopped after an uncertain import item; "
-                                    "do not retry automatically."
+                                    "PhotoKit stopped before a later import transaction began."
+                                    if not unknown_count
+                                    else (
+                                        "PhotoKit stopped after an uncertain import item; "
+                                        "do not retry automatically."
+                                    )
                                 ),
                                 "exception_type": "PhotoKitMutationEvidence",
                                 "detail": {
@@ -572,7 +608,7 @@ class Application:
                                         item_id
                                         for item_id, item in terminal_evidence.items()
                                         if item["status"]
-                                        == "not_attempted_after_unknown"
+                                        in {"not_attempted", "not_attempted_after_unknown"}
                                     ),
                                 },
                             }
@@ -636,18 +672,48 @@ class Application:
                     "exception_type": type(exc).__name__,
                 }
             )
-            result = OperationResult(
-                command="import.apply",
-                run_id=run_id,
-                ok=False,
-                status="outcome_unknown",
-                started_at=started,
-                finished_at=self._time(),
-                phase="verification_inconclusive",
-                manifest_sha256=manifest["manifest_sha256"],
-                library_snapshot={"kind": snapshot.kind, "snapshot_digest": snapshot.digest},
-                counts={"planned": len(manifest["items"]), "unknown": len(manifest["items"])},
-                items=[
+            commit_rejected = (
+                isinstance(exc, ApplePhotosError)
+                and exc.code
+                in {
+                    "E_BACKEND_PROTOCOL",
+                    "E_PERMISSION_PHOTOS",
+                    "E_NOT_FOUND",
+                    "E_RESOURCE_UNAVAILABLE",
+                    "E_PLAN_STALE",
+                    "E_AUTH_EXPIRED",
+                }
+                and isinstance(exc.detail, dict)
+                and exc.detail.get("mutation_phase") == "not_started"
+            )
+            if commit_rejected:
+                created_identifier_set = set(created_ids.values())
+                rejected_items = []
+                for item in manifest["items"]:
+                    item_id = item["item_id"]
+                    identifier = resolved.get(item_id)
+                    if identifier in created_identifier_set:
+                        rejected_items.append(
+                            {
+                                "item_id": item_id,
+                                "local_identifier": identifier,
+                                "status": "resolution_known",
+                                "evidence": (
+                                    created_evidence[item_id]["evidence"]
+                                    if item_id in created_evidence
+                                    else "batch_duplicate_parent"
+                                ),
+                            }
+                        )
+                    else:
+                        rejected_items.append(
+                            {"item_id": item_id, "status": "not_attempted"}
+                        )
+                known_count = sum(
+                    item["status"] == "resolution_known" for item in rejected_items
+                )
+            else:
+                rejected_items = [
                     {
                         "item_id": item["item_id"],
                         **(
@@ -658,7 +724,30 @@ class Application:
                         "status": "outcome_unknown",
                     }
                     for item in manifest["items"]
-                ],
+                ]
+                known_count = 0
+            result = OperationResult(
+                command="import.apply",
+                run_id=run_id,
+                ok=False,
+                status="partial" if commit_rejected else "outcome_unknown",
+                started_at=started,
+                finished_at=self._time(),
+                phase="commit_pending" if commit_rejected else "verification_inconclusive",
+                manifest_sha256=manifest["manifest_sha256"],
+                library_snapshot={"kind": snapshot.kind, "snapshot_digest": snapshot.digest},
+                counts={
+                    "planned": len(manifest["items"]),
+                    **(
+                        {
+                            "resolution_known": known_count,
+                            "not_attempted": len(manifest["items"]) - known_count,
+                        }
+                        if commit_rejected
+                        else {"unknown": len(manifest["items"])}
+                    ),
+                },
+                items=rejected_items,
                 artifacts={"manifest": str(manifest_path.resolve())},
                 errors=[error],
             )
@@ -702,30 +791,156 @@ class Application:
             "original_filename": asset.get("original_filename"),
             "media_type": asset.get("media_type"),
             "date_taken": asset.get("date_taken"),
+            "date_modified": asset.get("date_modified"),
+            "width": asset.get("width"),
+            "height": asset.get("height"),
             "resource_descriptor_digest": sha256_digest(descriptors),
             "in_trash": bool(asset.get("in_trash", False)),
         }
 
-    def plan_delete(self, local_identifiers: Sequence[str], *, output: Path) -> dict[str, Any]:
-        frozen = sorted(set(local_identifiers))
-        if not frozen:
-            raise usage_error("Delete planning requires at least one asset identifier.")
+    def _photo_resource_digests(
+        self, identifiers: Sequence[str], *, network: bool
+    ) -> dict[str, set[str]]:
+        digests: dict[str, set[str]] = {}
+        frozen = list(dict.fromkeys(identifiers))
+        for offset in range(0, len(frozen), 50):
+            chunk = frozen[offset : offset + 50]
+            resources = self.bridge.read_resources(chunk, network=network)
+            grouped = {
+                identifier: [
+                    resource
+                    for resource in resources
+                    if resource.local_identifier == identifier
+                ]
+                for identifier in chunk
+            }
+            if any(
+                len(grouped[identifier]) != 1
+                or grouped[identifier][0].availability != "available"
+                or grouped[identifier][0].role != "photo"
+                or not re.fullmatch(
+                    r"(?:sha256:)?[0-9a-f]{64}", grouped[identifier][0].sha256
+                )
+                for identifier in chunk
+            ) or any(resource.local_identifier not in grouped for resource in resources):
+                raise stale(
+                    "Pixel deletion requires exactly one available photo resource per asset.",
+                    code="E_RESOURCE_COVERAGE_INCOMPLETE",
+                )
+            for identifier, records in grouped.items():
+                digests[identifier] = {
+                    "sha256:" + records[0].sha256.removeprefix("sha256:")
+                }
+        return digests
+
+    @staticmethod
+    def _verify_delete_source_ownership(
+        items: Sequence[dict[str, Any]], resource_digests: dict[str, set[str]]
+    ) -> None:
+        for item in items:
+            proof = item["pixel_similarity_proof"]
+            candidate = item["local_identifier"]
+            keeper = proof["keeper_local_identifier"]
+            if proof["candidate_source_sha256"] not in resource_digests.get(candidate, set()):
+                raise stale(
+                    f"Compared candidate bytes are not a current PhotoKit resource: {candidate}.",
+                    code="E_PIXEL_SOURCE_MISMATCH",
+                )
+            if proof["keeper_source_sha256"] not in resource_digests.get(keeper, set()):
+                raise stale(
+                    f"Compared keeper bytes are not a current PhotoKit resource: {keeper}.",
+                    code="E_PIXEL_SOURCE_MISMATCH",
+                )
+
+    def plan_delete(
+        self,
+        evidence_report: Path,
+        pair_manifest: Path,
+        *,
+        output: Path,
+        network: bool = False,
+    ) -> dict[str, Any]:
+        report = load_similarity_report(evidence_report)
+        if len(report["items"]) > 50:
+            raise unsupported(
+                "Delete plans are limited to 50 pixel pairs per authorization.",
+                code="E_DELETE_BATCH_TOO_LARGE",
+            )
+        revalidate_similarity_report(report, pair_manifest)
+        if report["counts"]["byte_identical"]:
+            raise unsupported(
+                "Byte-identical duplicate deletion is not supported.",
+                code="E_PURE_DUPLICATE_UNSUPPORTED",
+            )
+        if not report["delete_authorizing"]:
+            raise stale(
+                "Pixel similarity evidence does not authorize deletion.",
+                code="E_PIXEL_GATE_FAILED",
+            )
+        compared = report["items"]
+        candidates = [item["candidate_local_identifier"] for item in compared]
+        keepers = [item["keeper_local_identifier"] for item in compared]
+        frozen = sorted(set(candidates + keepers))
         snapshot = self._mutation_snapshot()
         assets = self.bridge.fetch_assets(frozen)
         indexed = {str(asset["local_identifier"]): asset for asset in assets}
         missing = [identifier for identifier in frozen if identifier not in indexed]
         if missing:
             raise stale("One or more delete targets do not exist.", code="E_NOT_FOUND")
+        resource_digests = self._photo_resource_digests(frozen, network=network)
         items = []
-        for index, identifier in enumerate(frozen, start=1):
+        for index, evidence in enumerate(compared, start=1):
+            identifier = evidence["candidate_local_identifier"]
+            keeper_identifier = evidence["keeper_local_identifier"]
+            if (
+                indexed[identifier].get("media_type") != "image"
+                or indexed[keeper_identifier].get("media_type") != "image"
+                or len(indexed[identifier].get("resource_descriptors", [])) != 1
+                or len(indexed[keeper_identifier].get("resource_descriptors", [])) != 1
+                or indexed[identifier]["resource_descriptors"][0].get("role") != "photo"
+                or indexed[keeper_identifier]["resource_descriptors"][0].get("role") != "photo"
+            ):
+                raise unsupported(
+                    "Pixel deletion supports single-resource still-image PhotoKit assets only.",
+                    code="E_SIMILARITY_MEDIA_UNSUPPORTED",
+                )
+            candidate_digest = evidence["left"]["sha256"]
+            keeper_digest = evidence["right"]["sha256"]
+            if candidate_digest not in resource_digests.get(identifier, set()):
+                raise stale(
+                    f"Compared candidate bytes are not a current PhotoKit resource: {identifier}.",
+                    code="E_PIXEL_SOURCE_MISMATCH",
+                )
+            if keeper_digest not in resource_digests.get(keeper_identifier, set()):
+                raise stale(
+                    "Compared keeper bytes are not a current PhotoKit resource: "
+                    f"{keeper_identifier}.",
+                    code="E_PIXEL_SOURCE_MISMATCH",
+                )
             expected = self._delete_expected(indexed[identifier])
             if expected["in_trash"]:
                 raise stale(f"Delete target is already in Recently Deleted: {identifier}")
+            keeper_expected = self._delete_expected(indexed[keeper_identifier])
+            if keeper_expected["in_trash"]:
+                raise stale(f"Pixel keeper is already in Recently Deleted: {keeper_identifier}")
             items.append(
                 {
                     "item_id": f"del_{index:06d}",
                     "local_identifier": identifier,
                     "expected": expected,
+                    "pixel_similarity_proof": {
+                        "pair_id": evidence["pair_id"],
+                        "keeper_local_identifier": keeper_identifier,
+                        "keeper_expected": keeper_expected,
+                        "candidate_source_sha256": candidate_digest,
+                        "keeper_source_sha256": keeper_digest,
+                        "bytes_different": not evidence["byte_identical"],
+                        "dimensions": {
+                            "width": evidence["left"]["decode"]["width"],
+                            "height": evidence["left"]["decode"]["height"],
+                        },
+                        "metrics": evidence["metrics"],
+                    },
                     "planned_action": "move_to_recently_deleted",
                 }
             )
@@ -740,8 +955,20 @@ class Application:
             "library_snapshot": snapshot.to_dict(),
             "library_snapshot_digest": snapshot.digest,
             "effect": "move_to_recently_deleted",
+            "delete_policy": {
+                "proof": "pixel_similarity",
+                "pure_byte_duplicates": "unsupported",
+                "report_sha256": report["report_sha256"],
+                "source_manifest_sha256": report["source_manifest_sha256"],
+                "pair_manifest_path": str(pair_manifest.resolve()),
+                "network_access_allowed": network,
+                "policy": report["policy"],
+            },
             "items": items,
         }
+        manifest["evidence_attestation"] = AuthorizationService(
+            self.state_dir
+        ).attest_delete_evidence(manifest)
         return write_manifest(output, manifest)
 
     def apply_delete(
@@ -754,6 +981,7 @@ class Application:
         from apple_photos_cli.authorization import load_token
 
         manifest = load_manifest(manifest_path, expected_type="apple_photos_delete")
+        authorization.verify_delete_evidence(manifest)
         token = load_token(token_path)
         claims = authorization.verify(token, manifest)
         if replay.is_consumed(claims["nonce"]):
@@ -767,53 +995,65 @@ class Application:
                 code="E_LIBRARY_SNAPSHOT_MISMATCH",
             )
         identifiers = [item["local_identifier"] for item in manifest["items"]]
-        assets = self.bridge.fetch_assets(identifiers)
-        indexed = {str(asset["local_identifier"]): asset for asset in assets}
-        if set(indexed) != set(identifiers):
-            raise stale("Delete target set changed after planning.", code="E_PLAN_STALE")
-        for item in manifest["items"]:
-            if self._delete_expected(indexed[item["local_identifier"]]) != item["expected"]:
-                raise stale(
-                    f"Delete precondition changed for {item['local_identifier']}.",
-                    code="E_PLAN_STALE",
-                )
         run_id = self._run_id()
         started = self._time()
         mutation_started = False
+        pending_written = False
         try:
             with LibraryLock(self.state_dir, snapshot.digest):
                 if self._mutation_snapshot().digest != snapshot.digest:
                     raise stale("Library snapshot changed during delete preflight.")
-                assets = self.bridge.fetch_assets(identifiers)
-                indexed = {str(asset["local_identifier"]): asset for asset in assets}
-                if set(indexed) != set(identifiers):
-                    raise stale(
-                        "Delete target set changed during locked preflight.", code="E_PLAN_STALE"
-                    )
-                for item in manifest["items"]:
-                    if self._delete_expected(indexed[item["local_identifier"]]) != item["expected"]:
-                        raise stale(
-                            f"Delete precondition changed for {item['local_identifier']}.",
-                            code="E_PLAN_STALE",
-                        )
                 pending = OperationResult(
                     command="delete.apply",
                     run_id=run_id,
                     ok=False,
-                    status="running",
+                    status="outcome_unknown",
                     started_at=started,
                     finished_at=self._time(),
                     phase="commit_pending",
                     manifest_sha256=manifest["manifest_sha256"],
                     library_snapshot={"kind": snapshot.kind, "snapshot_digest": snapshot.digest},
-                    counts={"planned": len(manifest["items"])},
+                    counts={
+                        "planned": len(manifest["items"]),
+                        "unknown": len(manifest["items"]),
+                    },
+                    items=[
+                        {
+                            "item_id": item["item_id"],
+                            "local_identifier": item["local_identifier"],
+                            "status": "outcome_unknown",
+                        }
+                        for item in manifest["items"]
+                    ],
                     artifacts={"manifest": str(manifest_path.resolve())},
                 )
                 self._write_receipt(pending)
+                pending_written = True
+                authorization.verify(token, manifest)
                 replay.consume(claims["nonce"], manifest["manifest_sha256"], self._time())
                 mutation_started = True
-                self.bridge.delete_assets(manifest["items"])
+                acknowledged = self.bridge.delete_assets(
+                    manifest["items"],
+                    authorization_expires_at=claims["expires_at"],
+                    manifest_sha256=manifest["manifest_sha256"],
+                    evidence_attestation=manifest["evidence_attestation"],
+                    authorization_token=token,
+                    network_access_allowed=manifest["delete_policy"][
+                        "network_access_allowed"
+                    ],
+                )
+                if acknowledged["local_identifiers"] != identifiers:
+                    raise ApplePhotosError(
+                        "E_OUTCOME_UNKNOWN",
+                        "Delete response identifiers did not exactly match the request.",
+                        EXIT_PARTIAL,
+                    )
                 pending.phase = "commit_reported"
+                pending.counts = {
+                    "planned": len(manifest["items"]),
+                    "acknowledged": len(identifiers),
+                    "unknown": len(identifiers),
+                }
                 pending.finished_at = self._time()
                 self._write_receipt(pending)
                 verified = {
@@ -822,6 +1062,45 @@ class Application:
                 }
         except (Exception, KeyboardInterrupt) as exc:
             if not mutation_started:
+                if pending_written:
+                    error = (
+                        exc.to_dict()
+                        if isinstance(exc, ApplePhotosError)
+                        else {
+                            "code": "E_LOCAL_IO",
+                            "message": "Delete precommit processing failed.",
+                            "exception_type": type(exc).__name__,
+                        }
+                    )
+                    rejected = OperationResult(
+                        command="delete.apply",
+                        run_id=run_id,
+                        ok=False,
+                        status="partial",
+                        started_at=started,
+                        finished_at=self._time(),
+                        phase="commit_pending",
+                        manifest_sha256=manifest["manifest_sha256"],
+                        library_snapshot={
+                            "kind": snapshot.kind,
+                            "snapshot_digest": snapshot.digest,
+                        },
+                        counts={
+                            "planned": len(manifest["items"]),
+                            "not_attempted": len(manifest["items"]),
+                        },
+                        items=[
+                            {
+                                "item_id": item["item_id"],
+                                "local_identifier": item["local_identifier"],
+                                "status": "not_attempted",
+                            }
+                            for item in manifest["items"]
+                        ],
+                        artifacts={"manifest": str(manifest_path.resolve())},
+                        errors=[error],
+                    )
+                    self._write_receipt(rejected)
                 raise
             error = (
                 exc.to_dict()
@@ -832,22 +1111,43 @@ class Application:
                     "exception_type": type(exc).__name__,
                 }
             )
+            commit_rejected = (
+                isinstance(exc, ApplePhotosError)
+                and exc.code
+                in {
+                    "E_BACKEND_PROTOCOL",
+                    "E_PERMISSION_PHOTOS",
+                    "E_NOT_FOUND",
+                    "E_RESOURCE_UNAVAILABLE",
+                    "E_PLAN_STALE",
+                    "E_PIXEL_SOURCE_MISMATCH",
+                    "E_AUTH_EXPIRED",
+                    "E_AUTH_REPLAY",
+                }
+                and isinstance(exc.detail, dict)
+                and exc.detail.get("mutation_phase") == "not_started"
+            )
             result = OperationResult(
                 command="delete.apply",
                 run_id=run_id,
                 ok=False,
-                status="outcome_unknown",
+                status="partial" if commit_rejected else "outcome_unknown",
                 started_at=started,
                 finished_at=self._time(),
-                phase="verification_inconclusive",
+                phase="commit_pending" if commit_rejected else "verification_inconclusive",
                 manifest_sha256=manifest["manifest_sha256"],
                 library_snapshot={"kind": snapshot.kind, "snapshot_digest": snapshot.digest},
-                counts={"planned": len(manifest["items"]), "unknown": len(manifest["items"])},
+                counts={
+                    "planned": len(manifest["items"]),
+                    "not_attempted" if commit_rejected else "unknown": len(manifest["items"]),
+                },
                 items=[
                     {
                         "item_id": item["item_id"],
                         "local_identifier": item["local_identifier"],
-                        "status": "outcome_unknown",
+                        "status": (
+                            "not_attempted" if commit_rejected else "outcome_unknown"
+                        ),
                     }
                     for item in manifest["items"]
                 ],
@@ -868,11 +1168,16 @@ class Application:
                 }
             )
         unknown = sum(item["status"] == "outcome_unknown" for item in item_results)
+        status = (
+            "succeeded"
+            if unknown == 0
+            else ("outcome_unknown" if unknown == len(item_results) else "partial")
+        )
         result = OperationResult(
             command="delete.apply",
             run_id=run_id,
             ok=unknown == 0,
-            status="succeeded" if unknown == 0 else "outcome_unknown",
+            status=status,
             started_at=started,
             finished_at=self._time(),
             phase="verified" if unknown == 0 else "verification_inconclusive",
@@ -891,7 +1196,10 @@ class Application:
 
     def _write_receipt(self, result: OperationResult) -> None:
         runs = self.state_dir / "runs"
+        existed = runs.is_dir()
         runs.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            fsync_directory(self.state_dir)
         value = result.to_dict()
         validate_schema(value, "mutation-receipt-v1.schema.json")
         atomic_write_json(runs / f"{result.run_id}.json", value, mode=0o600)

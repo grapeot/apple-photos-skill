@@ -6,7 +6,7 @@ The offline test runner (`pytest`) must run decoupled from the macOS environment
 
 ### Test Categories
 - **Unit Tests**: Cover filtering, search parsing, resource-set digests, pixel similarity metrics, dimension and decode rejection, manifest canonicalization, TOCTOU safety, TTY inputs, HMAC tokens, expiration, and replay prevention.
-- **Contract Tests**: Validate assets, manifests, receipts, events, authorization claims, backups, and non-authorizing pixel evidence against JSON schemas. Bridge tests simulate helper outputs, structured per-item import evidence, malformed JSON, protocol mismatches, timeouts, stderr noise, and non-zero exit codes.
+- **Contract Tests**: Validate assets, manifests, receipts, events, authorization claims, backups, and pixel-authorizing evidence against JSON schemas. Pixel tests cover threshold ceilings, byte-identical rejection, source drift, PhotoKit ownership mismatch, planner attestation, and candidate/keeper role safety. Bridge tests simulate helper outputs, structured per-item import evidence, malformed JSON, protocol mismatches, timeouts, stderr noise, and non-zero exit codes.
 - **Integration Tests**: Inject synthetic readers and fake process bridges to verify read/search/filter/dump/backup, import duplicate reuse, partial coverage blocks, missing-placeholder sibling evidence, postcondition failures, delete workflows, stale asset rejections, and uncertainty handling.
 
 ## Static Safety Checks
@@ -28,4 +28,4 @@ Verification requires:
 
 ## Completion Standard
 
-An iteration is complete when Ruff, Python tests (138 total), Swift tests (11 total), package builds, and publication scans pass, and unexecuted live steps are recorded in [working.md](working.md).
+An iteration is complete when Ruff, the complete Python and Swift suites, package builds, and publication scans pass, and unexecuted live steps are recorded in [working.md](working.md). Current exact test counts belong in the verification log rather than this policy.

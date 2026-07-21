@@ -1,9 +1,10 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Photos
 import PhotoKitCore
 
-let protocolVersion = "1.0"
+let protocolVersion = "2.0"
 
 enum HelperError: Error {
     case invalidRequest(String)
@@ -12,6 +13,8 @@ enum HelperError: Error {
     case transaction(String)
     case resource(String)
     case stale(String)
+    case authorizationExpired(String)
+    case authorizationReplay(String)
 
     var code: String {
         switch self {
@@ -21,14 +24,25 @@ enum HelperError: Error {
         case .transaction: return "E_BACKEND_TRANSACTION"
         case .resource: return "E_RESOURCE_UNAVAILABLE"
         case .stale: return "E_PLAN_STALE"
+        case .authorizationExpired: return "E_AUTH_EXPIRED"
+        case .authorizationReplay: return "E_AUTH_REPLAY"
         }
     }
 
     var message: String {
         switch self {
         case let .invalidRequest(value), let .permission(value), let .notFound(value),
-             let .transaction(value), let .resource(value), let .stale(value):
+             let .transaction(value), let .resource(value), let .stale(value),
+             let .authorizationExpired(value):
             return value
+        case let .authorizationReplay(value): return value
+        }
+    }
+
+    var mutationPhase: String {
+        switch self {
+        case .transaction: return "commit_attempted"
+        default: return "not_started"
         }
     }
 }
@@ -39,7 +53,11 @@ func writeResponse(ok: Bool, result: Any? = nil, error: HelperError? = nil) {
         response["result"] = result
     }
     if let error {
-        response["error"] = ["code": error.code, "message": error.message]
+        response["error"] = [
+            "code": error.code,
+            "message": error.message,
+            "detail": ["mutation_phase": error.mutationPhase]
+        ]
     }
     do {
         let data = try JSONSerialization.data(withJSONObject: response, options: [.sortedKeys])
@@ -287,6 +305,7 @@ func readResources(_ payload: [String: Any]) throws -> [String: Any] {
                 "availability": "available",
                 "path": retainFiles ? url.path : NSNull()
             ])
+            if !retainFiles { try? FileManager.default.removeItem(at: url) }
         }
     }
     return ["resources": output]
@@ -350,9 +369,13 @@ func importValidatedAssets(
         return placeholder?.localIdentifier
     }
     let knownCount = evidence.filter { $0.status == .createdIdentifierKnown }.count
-    let unresolvedCount = evidence.count - knownCount
-    let status = unresolvedCount == 0
-        ? "succeeded" : (knownCount == 0 ? "outcome_unknown" : "partial")
+    let unknownCount = evidence.filter {
+        $0.status == .outcomeUnknown || $0.status == .notAttemptedAfterUnknown
+    }.count
+    let notAttemptedCount = evidence.filter { $0.status == .notAttempted }.count
+    let status = unknownCount > 0
+        ? (knownCount == 0 ? "outcome_unknown" : "partial")
+        : (notAttemptedCount > 0 ? "partial" : "succeeded")
     return [
         "status": status,
         "items": evidence.map { item -> [String: Any] in
@@ -390,29 +413,285 @@ func addAssetsToAlbum(_ payload: [String: Any]) throws -> [String: Any] {
     return ["local_identifiers": identifiers]
 }
 
+func urlSafeBase64Data(_ value: String) -> Data? {
+    var normalized = value.replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/")
+    normalized += String(repeating: "=", count: (4 - normalized.count % 4) % 4)
+    return Data(base64Encoded: normalized)
+}
+
+func exactKeys(_ value: [String: Any], _ expected: Set<String>) -> Bool {
+    Set(value.keys) == expected
+}
+
+func authorizationSecret() throws -> SymmetricKey {
+    guard let account = getpwuid(getuid()) else {
+        throw HelperError.invalidRequest("Current account home directory is unavailable.")
+    }
+    let path = URL(fileURLWithPath: String(cString: account.pointee.pw_dir), isDirectory: true)
+        .appendingPathComponent("Library/Application Support/apple-photos-skill")
+        .appendingPathComponent("authorization-secret").path
+    guard let data = FileManager.default.contents(atPath: path), data.count == 32 else {
+        throw HelperError.invalidRequest("Delete authorization secret is unavailable.")
+    }
+    return SymmetricKey(data: data)
+}
+
+func consumeNativeNonce(_ nonce: String, manifestDigest: String) throws {
+    guard let account = getpwuid(getuid()) else {
+        throw HelperError.invalidRequest("Current account home directory is unavailable.")
+    }
+    let root = URL(fileURLWithPath: String(cString: account.pointee.pw_dir), isDirectory: true)
+        .appendingPathComponent("Library/Application Support/apple-photos-skill/native-nonces")
+    let rootExisted = FileManager.default.fileExists(atPath: root.path)
+    try FileManager.default.createDirectory(
+        at: root, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    if !rootExisted {
+        let parent = Darwin.open(root.deletingLastPathComponent().path, O_RDONLY)
+        guard parent >= 0, Darwin.fsync(parent) == 0 else {
+            if parent >= 0 { Darwin.close(parent) }
+            throw HelperError.invalidRequest("Could not persist native replay directory.")
+        }
+        Darwin.close(parent)
+    }
+    let path = root.appendingPathComponent(nonce).path
+    let descriptor = Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+    guard descriptor >= 0 else {
+        if errno == EEXIST {
+            throw HelperError.authorizationReplay("Delete authorization was already used.")
+        }
+        throw HelperError.invalidRequest("Could not persist native authorization replay state.")
+    }
+    defer { Darwin.close(descriptor) }
+    let data = Data(manifestDigest.utf8)
+    let written = data.withUnsafeBytes { buffer in
+        Darwin.write(descriptor, buffer.baseAddress, buffer.count)
+    }
+    guard written == data.count, Darwin.fsync(descriptor) == 0 else {
+        throw HelperError.invalidRequest("Could not persist native authorization replay state.")
+    }
+    let directory = Darwin.open(root.path, O_RDONLY)
+    guard directory >= 0 else {
+        throw HelperError.invalidRequest("Could not persist native authorization replay state.")
+    }
+    defer { Darwin.close(directory) }
+    guard Darwin.fsync(directory) == 0 else {
+        throw HelperError.invalidRequest("Could not persist native authorization replay state.")
+    }
+}
+
+func verifiedSignedObject(
+    encoded: Any?, signature: Any?, key: SymmetricKey
+) throws -> ([String: Any], Data) {
+    guard let encoded = encoded as? String,
+          let signed = urlSafeBase64Data(encoded),
+          let signature = signature as? String,
+          let signatureData = urlSafeBase64Data(signature),
+          HMAC<SHA256>.isValidAuthenticationCode(
+              signatureData, authenticating: signed, using: key
+          ),
+          let object = try JSONSerialization.jsonObject(with: signed) as? [String: Any] else {
+        throw HelperError.invalidRequest("Delete authorization signature is invalid.")
+    }
+    return (object, signed)
+}
+
+func verifyDeleteAuthorizationEnvelope(
+    _ payload: [String: Any], items: [[String: Any]], manifestDigest: String
+) throws -> Date {
+    let key = try authorizationSecret()
+    guard let attestation = payload["evidence_attestation"] as? [String: Any],
+          exactKeys(attestation, ["algorithm", "claims_sha256", "signed_claims", "signature"]),
+          attestation["algorithm"] as? String == "hmac-sha256",
+          let claimsDigest = attestation["claims_sha256"] as? String else {
+        throw HelperError.invalidRequest("Delete evidence attestation is malformed.")
+    }
+    let (evidenceClaims, signedEvidence) = try verifiedSignedObject(
+        encoded: attestation["signed_claims"], signature: attestation["signature"], key: key
+    )
+    let observedEvidenceDigest = SHA256.hash(data: signedEvidence)
+        .map { String(format: "%02x", $0) }.joined()
+    let manifestFormatter = ISO8601DateFormatter()
+    manifestFormatter.formatOptions = [.withInternetDateTime]
+    guard claimsDigest == "sha256:\(observedEvidenceDigest)",
+          evidenceClaims["purpose"] as? String == "pixel_delete_plan_v1",
+          let signedManifest = evidenceClaims["manifest"] as? [String: Any],
+          let signedItems = signedManifest["items"] as? [[String: Any]],
+          (signedItems as NSArray).isEqual(to: items),
+          let deletePolicy = signedManifest["delete_policy"] as? [String: Any],
+          let signedNetwork = deletePolicy["network_access_allowed"] as? Bool,
+          payload["network_access_allowed"] as? Bool == signedNetwork,
+          let createdValue = signedManifest["created_at"] as? String,
+          let manifestExpiresValue = signedManifest["expires_at"] as? String,
+          let createdAt = manifestFormatter.date(from: createdValue),
+          let manifestExpiresAt = manifestFormatter.date(from: manifestExpiresValue),
+          createdAt <= Date().addingTimeInterval(5 * 60),
+          manifestExpiresAt > Date(), manifestExpiresAt > createdAt,
+          manifestExpiresAt.timeIntervalSince(createdAt) <= 24 * 60 * 60 else {
+        throw HelperError.invalidRequest("Delete evidence does not match the requested items.")
+    }
+
+    guard let token = payload["authorization_token"] as? [String: Any],
+          exactKeys(token, ["claims", "signed_claims", "signature"]),
+          let claims = token["claims"] as? [String: Any],
+          exactKeys(claims, [
+              "schema_version", "action", "manifest_sha256", "evidence_claims_sha256",
+              "library_snapshot_digest", "item_count", "issued_at", "expires_at",
+              "nonce", "cli_major"
+          ]) else {
+        throw HelperError.invalidRequest("Delete authorization token is malformed.")
+    }
+    let (signedClaims, _) = try verifiedSignedObject(
+        encoded: token["signed_claims"], signature: token["signature"], key: key
+    )
+    guard (claims as NSDictionary).isEqual(to: signedClaims),
+          claims["schema_version"] as? String == "1.0",
+          claims["action"] as? String == "delete_assets",
+          claims["manifest_sha256"] as? String == manifestDigest,
+          claims["evidence_claims_sha256"] as? String == claimsDigest,
+          claims["item_count"] as? Int == items.count,
+          claims["cli_major"] as? Int == 1,
+          let nonce = claims["nonce"] as? String,
+          nonce.count == 64,
+          nonce.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
+          let issuedValue = claims["issued_at"] as? String,
+          let expiresValue = claims["expires_at"] as? String else {
+        throw HelperError.invalidRequest("Delete authorization claims are invalid.")
+    }
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+    guard let issuedAt = formatter.date(from: issuedValue),
+          let expiresAt = formatter.date(from: expiresValue),
+          expiresAt > issuedAt,
+          expiresAt.timeIntervalSince(issuedAt) <= 15 * 60,
+          issuedAt <= Date().addingTimeInterval(5 * 60),
+          deleteAuthorizationIsValid(expiresAt: expiresAt),
+          payload["authorization_expires_at"] as? String == expiresValue else {
+        throw HelperError.authorizationExpired("Delete authorization is expired or invalid.")
+    }
+    try consumeNativeNonce(nonce, manifestDigest: manifestDigest)
+    return expiresAt
+}
+
+func verifyDeletePixelSources(
+    _ items: [[String: Any]], indexed: [String: PHAsset], network: Bool
+) throws {
+    var expected: [String: String] = [:]
+    for item in items {
+        guard let candidate = item["local_identifier"] as? String,
+              let proof = item["pixel_similarity_proof"] as? [String: Any],
+              let keeper = proof["keeper_local_identifier"] as? String,
+              let candidateDigest = proof["candidate_source_sha256"] as? String,
+              let keeperDigest = proof["keeper_source_sha256"] as? String else {
+            throw HelperError.invalidRequest("Delete pixel source proof is malformed.")
+        }
+        for (identifier, digest) in [(candidate, candidateDigest), (keeper, keeperDigest)] {
+            if let existing = expected[identifier], existing != digest {
+                throw HelperError.invalidRequest("Delete pixel source proof is inconsistent.")
+            }
+            expected[identifier] = digest
+        }
+    }
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("apple-photos-delete-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    for (identifier, digest) in expected {
+        guard let asset = indexed[identifier] else { throw HelperError.notFound(identifier) }
+        let resources = PHAssetResource.assetResources(for: asset)
+        guard resources.count == 1, resourceRole(resources[0].type) == "photo" else {
+            throw HelperError.resource(
+                "Pixel deletion requires exactly one available photo resource per asset."
+            )
+        }
+        let url = root.appendingPathComponent(UUID().uuidString)
+        if let error = writeResource(resources[0], to: url, network: network) {
+            throw HelperError.resource(error.localizedDescription)
+        }
+        guard "sha256:\(try sha256File(url))" == digest else {
+            throw HelperError.stale("A pixel source resource changed before delete mutation.")
+        }
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
 func deleteAssets(_ payload: [String: Any]) throws -> [String: Any] {
+    guard let items = payload["items"] as? [[String: Any]],
+          !items.isEmpty, items.count <= 50 else {
+        throw HelperError.invalidRequest("Delete requires between 1 and 50 items.")
+    }
+    guard let manifestDigest = payload["manifest_sha256"] as? String,
+          manifestDigest.hasPrefix("sha256:") else {
+        throw HelperError.invalidRequest("Delete requires a bound authorization envelope.")
+    }
+    let expiresAt = try verifyDeleteAuthorizationEnvelope(
+        payload, items: items, manifestDigest: manifestDigest
+    )
+    guard let network = payload["network_access_allowed"] as? Bool else {
+        throw HelperError.invalidRequest("Delete resource network policy is required.")
+    }
     try requestAuthorization()
-    guard let items = payload["items"] as? [[String: Any]], !items.isEmpty else {
-        throw HelperError.invalidRequest("Delete requires a non-empty items array.")
+    let identifiers = items.compactMap { $0["local_identifier"] as? String }
+    let keeperIdentifiers = items.compactMap {
+        ($0["pixel_similarity_proof"] as? [String: Any])?["keeper_local_identifier"] as? String
     }
-    let identifiers = try items.map { item -> String in
-        guard let identifier = item["local_identifier"] as? String else {
-            throw HelperError.invalidRequest("Every delete item requires an identifier.")
-        }
-        return identifier
-    }
-    let assets = fetchAssets(identifiers)
-    guard assets.count == identifiers.count else {
-        throw HelperError.notFound("One or more assets were not found before delete mutation.")
-    }
+    let assets = fetchAssets(Array(Set(identifiers + keeperIdentifiers)))
+    let indexed = Dictionary(uniqueKeysWithValues: assets.map { ($0.localIdentifier, $0) })
+    let actual = indexed.mapValues(assetDictionary)
     do {
-        try PHPhotoLibrary.shared().performChangesAndWait {
-            PHAssetChangeRequest.deleteAssets(assets as NSArray)
+        return try executeValidatedDelete(items, actualByIdentifier: actual) { validatedIdentifiers in
+            try verifyDeletePixelSources(items, indexed: indexed, network: network)
+            guard deleteAuthorizationIsValid(expiresAt: expiresAt) else {
+                throw HelperError.authorizationExpired(
+                    "Delete authorization expired during native preflight."
+                )
+            }
+            var boundaryError: Error?
+            var registeredIdentifiers: [String] = []
+            try PHPhotoLibrary.shared().performChangesAndWait {
+                do {
+                    let refreshedAssets = fetchAssets(Array(Set(identifiers + keeperIdentifiers)))
+                    let refreshed = Dictionary(
+                        uniqueKeysWithValues: refreshedAssets.map { ($0.localIdentifier, $0) }
+                    )
+                    let refreshedActual = refreshed.mapValues(assetDictionary)
+                    try executeValidatedDelete(
+                        items, actualByIdentifier: refreshedActual
+                    ) { boundaryIdentifiers in
+                        guard deleteAuthorizationIsValid(expiresAt: expiresAt) else {
+                            throw HelperError.authorizationExpired(
+                                "Delete authorization expired at transaction registration."
+                            )
+                        }
+                        let boundaryAssets = boundaryIdentifiers.compactMap { refreshed[$0] }
+                        PHAssetChangeRequest.deleteAssets(boundaryAssets as NSArray)
+                        registeredIdentifiers = boundaryIdentifiers
+                    }
+                } catch {
+                    boundaryError = error
+                }
+            }
+            if let boundaryError { throw boundaryError }
+            guard registeredIdentifiers == validatedIdentifiers else {
+                throw HelperError.stale("Delete registration did not match validated identifiers.")
+            }
+            return ["local_identifiers": validatedIdentifiers]
         }
+    } catch DeleteValidationError.malformed {
+        throw HelperError.invalidRequest("Every delete item requires an identifier and expected state.")
+    } catch DeleteValidationError.duplicateIdentifier {
+        throw HelperError.invalidRequest("Delete identifiers must be unique.")
+    } catch DeleteValidationError.missingAsset {
+        throw HelperError.notFound("One or more assets were not found before delete mutation.")
+    } catch DeleteValidationError.stale {
+        throw HelperError.stale("A delete precondition changed before the native transaction.")
+    } catch let error as HelperError {
+        throw error
     } catch {
         throw HelperError.transaction(error.localizedDescription)
     }
-    return ["local_identifiers": identifiers]
 }
 
 func verifyAssets(_ payload: [String: Any]) throws -> [String: Any] {

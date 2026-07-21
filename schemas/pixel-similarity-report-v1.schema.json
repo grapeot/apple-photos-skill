@@ -21,8 +21,8 @@
     "schema_version": {"const": "1.0"},
     "report_type": {"const": "apple_photos_pixel_similarity"},
     "created_at": {"type": "string", "format": "date-time"},
-    "mode": {"const": "read_only_evidence"},
-    "delete_authorizing": {"const": false},
+    "mode": {"const": "pixel_similarity_delete_evidence"},
+    "delete_authorizing": {"type": "boolean"},
     "source_manifest_sha256": {"$ref": "#/$defs/sha256"},
     "policy": {
       "type": "object",
@@ -37,19 +37,21 @@
     "counts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["total", "compared", "passed", "failed", "rejected"],
+      "required": ["total", "compared", "passed", "failed", "rejected", "byte_identical"],
       "properties": {
         "total": {"type": "integer", "minimum": 1},
         "compared": {"type": "integer", "minimum": 0},
         "passed": {"type": "integer", "minimum": 0},
         "failed": {"type": "integer", "minimum": 0},
-        "rejected": {"type": "integer", "minimum": 0}
+        "rejected": {"type": "integer", "minimum": 0},
+        "byte_identical": {"type": "integer", "minimum": 0}
       }
     },
     "gate_passed": {"type": "boolean"},
     "items": {
       "type": "array",
       "minItems": 1,
+      "maxItems": 50,
       "items": {"oneOf": [{"$ref": "#/$defs/compared"}, {"$ref": "#/$defs/rejected"}]}
     },
     "report_sha256": {"$ref": "#/$defs/sha256"}
@@ -61,8 +63,11 @@
       "additionalProperties": false,
       "required": [
         "pair_id",
+        "candidate_local_identifier",
+        "keeper_local_identifier",
         "status",
         "passed",
+        "byte_identical",
         "dimensions_equal",
         "left",
         "right",
@@ -71,8 +76,11 @@
       ],
       "properties": {
         "pair_id": {"type": "string", "minLength": 1},
+        "candidate_local_identifier": {"type": "string", "minLength": 1},
+        "keeper_local_identifier": {"type": "string", "minLength": 1},
         "status": {"const": "compared"},
         "passed": {"type": "boolean"},
+        "byte_identical": {"type": "boolean"},
         "dimensions_equal": {"type": "boolean"},
         "left": {"$ref": "#/$defs/input"},
         "right": {"$ref": "#/$defs/input"},
@@ -83,9 +91,11 @@
     "rejected": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["pair_id", "status", "passed", "error"],
+      "required": ["pair_id", "candidate_local_identifier", "keeper_local_identifier", "status", "passed", "error"],
       "properties": {
         "pair_id": {"type": "string", "minLength": 1},
+        "candidate_local_identifier": {"type": "string", "minLength": 1},
+        "keeper_local_identifier": {"type": "string", "minLength": 1},
         "status": {"const": "rejected"},
         "passed": {"const": false},
         "error": {"$ref": "#/$defs/error"}

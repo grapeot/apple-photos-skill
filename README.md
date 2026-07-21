@@ -45,11 +45,12 @@ The native helper requires macOS Photos read/write authorization. The Python pro
 - **Reads**: Run against a user-specified `.photoslibrary` path.
 - **Snapshots**: Plans bind to the System Photo Library's sorted PhotoKit asset-ID-set snapshot. Public PhotoKit does not expose library filesystem paths, so snapshot equality does not prove physical library identity.
 - **Imports**: Plans enforce SHA-256 duplicate checks before staging. Execution requires `--manifest` and `--apply`. Items execute in individual PhotoKit transactions. The first transaction error or missing placeholder returns `outcome_unknown`, prevents every later item transaction, and marks those items `not_attempted_after_unknown`. Receipts preserve identifiers from earlier successful items, and the batch reports a non-retryable `partial` or `outcome_unknown` result without later mutations.
-- **Deletions**: Move assets to Recently Deleted; permanent erase or bypassing macOS confirmation is unsupported. Plans freeze local identifiers and metadata. Applying requires `--manifest`, `--authorization-token`, and `--apply`.
+- **Deletions**: Move pixel-verified candidates to Recently Deleted; permanent erase or bypassing macOS confirmation is unsupported. Plans freeze candidate/keeper identifiers, pixel metrics, source bindings, and metadata. Applying requires `--manifest`, `--authorization-token`, and `--apply`.
 - **Authorization**: Deletes require interactive TTY input of `DELETE <count> <digest-prefix>` to generate a 15-minute manifest-bound HMAC token, which is consumed in a local ledger before executing helper mutations.
-- **Isolation**: The HMAC token prevents local plan substitution; it is not a boundary against same-user processes. macOS TCC and PhotoKit confirmation dialogs enforce system-level boundaries.
+- **Delete Batch Bound**: Each delete manifest is limited to 50 candidate/keeper pairs so native source hashing and PhotoKit preflight remain bounded by the authorization window. Split larger evidence sets into separately reviewed and authorized manifests.
+- **Isolation**: The Python orchestrator and native helper both verify the planner attestation and human authorization HMAC. This prevents unsigned direct helper requests and local plan substitution; it is not a boundary against same-user processes that can read the local secret. macOS TCC and PhotoKit confirmation dialogs enforce system-level boundaries.
 - **Namespaces**: `osxphotos_uuid` and `osxphotos_album_uuid` (reads) are distinct from `photokit_local_identifier` (mutations). Resolve mutation identifiers via `apple-photos asset mutation-list` and `apple-photos album mutation-list`.
-- **Pixel Evidence**: `evidence compare-images` compares frozen local image pairs after EXIF orientation and sRGB normalization. Its reports always set `delete_authorizing` to `false`; passing similarity thresholds never proves an exact duplicate and cannot authorize deletion.
+- **Pixel Evidence**: `evidence compare-images` is the only supported deletion evidence. A report authorizes planning only when every byte-different, single-resource still-image pair has equal dimensions and passes the canonical pixel thresholds. Compound, partially available, and non-photo resource sets are rejected. SHA-256 binds each compared input to its candidate or keeper PhotoKit resource; the helper repeats this ownership check immediately before mutation, and hash equality is not a duplicate criterion.
 
 ## Read Examples
 
@@ -70,12 +71,12 @@ apple-photos metadata backup --library ./Example.photoslibrary --output ./metada
 
 `metadata backup` generates a checksummed metadata snapshot, not a media file or `.photoslibrary` directory backup.
 
-## Read-Only Pixel Evidence
+## Pixel Deletion Evidence
 
 Create a JSONL pair manifest:
 
 ```json
-{"pair_id":"pair-0001","left":"./candidate.png","right":"./keeper.jpg"}
+{"pair_id":"pair-0001","left":"./candidate.png","right":"./keeper.jpg","candidate_local_identifier":"candidate/L0/001","keeper_local_identifier":"keeper/L0/001"}
 ```
 
 Run the default conservative comparison gate:
@@ -88,7 +89,7 @@ apple-photos evidence compare-images \
 
 The default policy requires equal dimensions, RGB mean absolute error at or below 1%, per-pixel luminance mean absolute error at or below 1%, and the 99th percentile of each pixel's maximum RGB-channel error at or below 5%. Global average brightness alone is intentionally insufficient because unrelated images can share the same average brightness. High-bit-depth or unverifiable-bit-depth images, non-opaque alpha, animated images, multi-frame images, videos, oversized inputs, decode failures, and invalid ICC profiles fail closed. Any failed or rejected pair makes the command return exit code `8` after writing the complete report.
 
-This command only produces review evidence. It is not connected to `delete plan`, `delete authorize`, or `delete apply`, and its output schema requires `delete_authorizing: false`.
+The report sets `delete_authorizing: true` only when every pair passes under thresholds no weaker than the defaults and the two source files are not byte-identical. Failed, rejected, or byte-identical pairs cannot enter a delete plan. SHA-256 values in the report establish frozen-input integrity and PhotoKit resource ownership; candidate and keeper hashes are not compared for equality.
 
 ## Mutation Planning
 
@@ -110,7 +111,8 @@ Plan deletions:
 
 ```bash
 apple-photos delete plan \
-  --asset-id asset-local-id \
+  --evidence-report ./pixel-evidence.json \
+  --pair-manifest ./pairs.jsonl \
   --output ./delete-plan.json
 ```
 
@@ -164,4 +166,5 @@ Offline tests use synthetic asset fixtures and a mock PhotoKit bridge. They do n
 - **Live Tests**: Requires manual opt-in.
 - **Resource Scope**: Imports support single-resource images and videos only. Compound assets (e.g., Live Photos, RAW+JPEG, bursts, edited pairs, Shared Albums, and iCloud Shared Library mutations) fail closed.
 - **Post-Mutation State**: Post-deletion visibility and iCloud consistency vary by macOS version. Uncertain outcomes report as `outcome_unknown` and are not retried.
+- **System Confirmation**: PhotoKit deletion may block while macOS waits for a Photos confirmation window. Delete dispatch has no client deadline, so the process and library lock remain active until the prompt is answered. Stay present. If the process is externally interrupted or crashes, treat the outcome as unknown, never retry automatically, and reconcile all frozen identifiers read-only.
 - **Library Tracking**: Public PhotoKit does not expose System Photo Library filesystem paths or physical library identifiers. Snapshots digest the sorted PhotoKit asset-ID set; this detects content drift but cannot distinguish copies/restorations sharing identical IDs.

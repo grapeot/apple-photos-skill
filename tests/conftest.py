@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from PIL import Image
 
 from apple_photos_cli.application import Application
-from apple_photos_cli.canonical import asset_id_set_digest
+from apple_photos_cli.canonical import asset_id_set_digest, sha256_digest
+from apple_photos_cli.errors import stale
 from apple_photos_cli.hashing import sha256_file
 from apple_photos_cli.models import (
     AlbumRecord,
@@ -17,8 +21,44 @@ from apple_photos_cli.models import (
     PhotoKitAlbumRecord,
     ResourceRecord,
 )
+from apple_photos_cli.similarity import SimilarityPolicy, compare_image_manifest
 
 FIXED_TIME = datetime(2030, 1, 2, 3, 4, 5, tzinfo=UTC)
+
+
+def write_pixel_report(
+    fake_bridge: FakeBridge, path: Path, candidate_ids: list[str]
+) -> tuple[Path, Path]:
+    pair_manifest = path.with_suffix(".pairs.jsonl")
+    records = []
+    for index, candidate_id in enumerate(candidate_ids, start=1):
+        keeper_id = f"{candidate_id}-keeper"
+        candidate_path = path.parent / f"candidate-{index}.png"
+        keeper_path = path.parent / f"keeper-{index}.png"
+        candidate_buffer = io.BytesIO()
+        keeper_buffer = io.BytesIO()
+        Image.new("RGB", (8, 8), (100, 100, 100)).save(candidate_buffer, format="PNG")
+        Image.new("RGB", (8, 8), (102, 102, 102)).save(keeper_buffer, format="PNG")
+        candidate_bytes = candidate_buffer.getvalue()
+        keeper_bytes = keeper_buffer.getvalue()
+        candidate_path.write_bytes(candidate_bytes)
+        keeper_path.write_bytes(keeper_bytes)
+        fake_bridge.add_asset(candidate_id, candidate_bytes)
+        fake_bridge.add_asset(keeper_id, keeper_bytes)
+        records.append(
+            {
+                "pair_id": f"pair-{index}",
+                "left": str(candidate_path),
+                "right": str(keeper_path),
+                "candidate_local_identifier": candidate_id,
+                "keeper_local_identifier": keeper_id,
+            }
+        )
+    pair_manifest.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+    )
+    compare_image_manifest(pair_manifest, path, SimilarityPolicy())
+    return path, pair_manifest
 
 
 class FakeReader:
@@ -211,9 +251,72 @@ class FakeBridge:
             self.memberships.add((album_id, identifier))
         return {"local_identifiers": local_identifiers}
 
-    def delete_assets(self, items: list[dict[str, Any]]) -> dict[str, Any]:
-        self.calls.append("delete-assets")
+    def delete_assets(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        authorization_expires_at: str,
+        manifest_sha256: str,
+        evidence_attestation: dict[str, Any],
+        authorization_token: dict[str, Any],
+        network_access_allowed: bool = False,
+    ) -> dict[str, Any]:
+        assert authorization_expires_at
+        assert manifest_sha256
+        assert evidence_attestation
+        assert authorization_token
+        assert isinstance(network_access_allowed, bool)
         local_identifiers = [item["local_identifier"] for item in items]
+        for item in items:
+            proof = item["pixel_similarity_proof"]
+            candidate_resources = self.resources.get(item["local_identifier"], [])
+            keeper_resources = self.resources.get(proof["keeper_local_identifier"], [])
+            if (
+                len(candidate_resources) != 1
+                or candidate_resources[0].role != "photo"
+                or candidate_resources[0].availability != "available"
+                or "sha256:" + candidate_resources[0].sha256.removeprefix("sha256:")
+                != proof["candidate_source_sha256"]
+                or len(keeper_resources) != 1
+                or keeper_resources[0].role != "photo"
+                or keeper_resources[0].availability != "available"
+                or "sha256:" + keeper_resources[0].sha256.removeprefix("sha256:")
+                != proof["keeper_source_sha256"]
+            ):
+                raise stale(
+                    "Synthetic native pixel source changed.",
+                    code="E_PIXEL_SOURCE_MISMATCH",
+                    detail={"mutation_phase": "not_started"},
+                )
+            for identifier, planned in (
+                (item["local_identifier"], item["expected"]),
+                (proof["keeper_local_identifier"], proof["keeper_expected"]),
+            ):
+                asset = self.assets.get(identifier)
+                if asset is None:
+                    raise stale(
+                        "Synthetic native delete target is missing.",
+                        code="E_NOT_FOUND",
+                        detail={"mutation_phase": "not_started"},
+                    )
+                expected = {
+                    "original_filename": asset.get("original_filename"),
+                    "media_type": asset.get("media_type"),
+                    "date_taken": asset.get("date_taken"),
+                    "date_modified": asset.get("date_modified"),
+                    "width": asset.get("width"),
+                    "height": asset.get("height"),
+                    "resource_descriptor_digest": sha256_digest(
+                        asset.get("resource_descriptors", [])
+                    ),
+                    "in_trash": bool(asset.get("in_trash", False)),
+                }
+                if expected != planned:
+                    raise stale(
+                        "Synthetic native delete precondition changed.",
+                        detail={"mutation_phase": "not_started"},
+                    )
+        self.calls.append("delete-assets")
         self.deleted.update(local_identifiers)
         return {"local_identifiers": local_identifiers}
 
@@ -248,6 +351,9 @@ class FakeBridge:
             "media_type": "image",
             "original_filename": filename,
             "date_taken": "2029-01-01T00:00:00Z",
+            "date_modified": None,
+            "width": 8,
+            "height": 8,
             "in_trash": False,
             "resource_descriptors": [resource.digest_member()],
         }

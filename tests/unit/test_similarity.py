@@ -16,6 +16,8 @@ from apple_photos_cli.similarity import (
     compare_image_manifest,
     compare_images,
     load_pair_manifest,
+    load_similarity_report,
+    revalidate_similarity_report,
 )
 
 
@@ -166,7 +168,13 @@ def test_policy_rejects_out_of_range_threshold() -> None:
 
 def test_manifest_requires_unique_pair_ids(tmp_path: Path) -> None:
     manifest = tmp_path / "pairs.jsonl"
-    record = {"pair_id": "pair-1", "left": "a", "right": "b"}
+    record = {
+        "pair_id": "pair-1",
+        "left": "a",
+        "right": "b",
+        "candidate_local_identifier": "candidate-id",
+        "keeper_local_identifier": "keeper-id",
+    }
     manifest.write_text(json.dumps(record) + "\n" + json.dumps(record) + "\n")
 
     with pytest.raises(ApplePhotosError, match="Duplicate pair_id"):
@@ -185,8 +193,20 @@ def test_batch_report_is_non_authorizing_and_digest_bound(tmp_path: Path) -> Non
         "\n".join(
             json.dumps(record)
             for record in (
-                {"pair_id": "pass", "left": str(left), "right": str(right)},
-                {"pair_id": "reject", "left": str(left), "right": str(invalid)},
+                    {
+                        "pair_id": "pass",
+                        "left": str(left),
+                        "right": str(right),
+                        "candidate_local_identifier": "candidate-pass",
+                        "keeper_local_identifier": "keeper-pass",
+                    },
+                    {
+                        "pair_id": "reject",
+                        "left": str(left),
+                        "right": str(invalid),
+                        "candidate_local_identifier": "candidate-reject",
+                        "keeper_local_identifier": "keeper-reject",
+                    },
             )
         )
         + "\n"
@@ -202,11 +222,123 @@ def test_batch_report_is_non_authorizing_and_digest_bound(tmp_path: Path) -> Non
         "passed": 1,
         "failed": 0,
         "rejected": 1,
+        "byte_identical": 1,
     }
     assert report["items"][1]["error"]["code"] == "E_SIMILARITY_MEDIA_UNSUPPORTED"
     assert str(invalid) not in report["items"][1]["error"]["message"]
     digest = report.pop("report_sha256")
     assert digest == sha256_digest(report)
+
+
+def test_pixel_report_authorizes_byte_different_images_within_policy(tmp_path: Path) -> None:
+    left = tmp_path / "left.png"
+    right = tmp_path / "right.png"
+    _image(left, (100, 100, 100))
+    _image(right, (102, 102, 102))
+    manifest = tmp_path / "pairs.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "pair_id": "pair-1",
+                "left": str(left),
+                "right": str(right),
+                "candidate_local_identifier": "candidate-id",
+                "keeper_local_identifier": "keeper-id",
+            }
+        )
+        + "\n"
+    )
+
+    report_path = tmp_path / "report.json"
+    report = compare_image_manifest(manifest, report_path, SimilarityPolicy())
+
+    assert report["gate_passed"] is True
+    assert report["delete_authorizing"] is True
+    assert report["counts"]["byte_identical"] == 0
+    revalidate_similarity_report(load_similarity_report(report_path), manifest)
+
+
+def test_byte_identical_pair_is_not_delete_authorizing(tmp_path: Path) -> None:
+    left = tmp_path / "left.png"
+    right = tmp_path / "right.png"
+    _image(left, (100, 100, 100))
+    right.write_bytes(left.read_bytes())
+    manifest = tmp_path / "pairs.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "pair_id": "pair-1",
+                "left": str(left),
+                "right": str(right),
+                "candidate_local_identifier": "candidate-id",
+                "keeper_local_identifier": "keeper-id",
+            }
+        )
+        + "\n"
+    )
+
+    report = compare_image_manifest(manifest, tmp_path / "report.json", SimilarityPolicy())
+
+    assert report["gate_passed"] is True
+    assert report["delete_authorizing"] is False
+    assert report["counts"]["byte_identical"] == 1
+
+
+def test_lax_pixel_policy_is_never_delete_authorizing(tmp_path: Path) -> None:
+    left = tmp_path / "left.png"
+    right = tmp_path / "right.png"
+    _image(left, (100, 100, 100))
+    _image(right, (110, 110, 110))
+    manifest = tmp_path / "pairs.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "pair_id": "pair-1",
+                "left": str(left),
+                "right": str(right),
+                "candidate_local_identifier": "candidate-id",
+                "keeper_local_identifier": "keeper-id",
+            }
+        )
+        + "\n"
+    )
+
+    report = compare_image_manifest(
+        manifest,
+        tmp_path / "report.json",
+        SimilarityPolicy(max_rgb_mae=0.5, max_luma_mae=0.5, max_rgb_p99=0.5),
+    )
+
+    assert report["gate_passed"] is True
+    assert report["delete_authorizing"] is False
+
+
+def test_pair_source_drift_invalidates_authorizing_report(tmp_path: Path) -> None:
+    left = tmp_path / "left.png"
+    right = tmp_path / "right.png"
+    _image(left, (100, 100, 100))
+    _image(right, (102, 102, 102))
+    manifest = tmp_path / "pairs.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "pair_id": "pair-1",
+                "left": str(left),
+                "right": str(right),
+                "candidate_local_identifier": "candidate-id",
+                "keeper_local_identifier": "keeper-id",
+            }
+        )
+        + "\n"
+    )
+    report_path = tmp_path / "report.json"
+    compare_image_manifest(manifest, report_path, SimilarityPolicy())
+    _image(left, (120, 120, 120))
+
+    with pytest.raises(ApplePhotosError) as captured:
+        revalidate_similarity_report(load_similarity_report(report_path), manifest)
+
+    assert captured.value.code == "E_PIXEL_EVIDENCE_STALE"
 
 
 def test_cli_returns_partial_when_any_pair_is_rejected(tmp_path: Path, capsys) -> None:
@@ -217,7 +349,16 @@ def test_cli_returns_partial_when_any_pair_is_rejected(tmp_path: Path, capsys) -
     manifest = tmp_path / "pairs.jsonl"
     report_path = tmp_path / "report.json"
     manifest.write_text(
-        json.dumps({"pair_id": "reject", "left": str(left), "right": str(invalid)}) + "\n"
+        json.dumps(
+            {
+                "pair_id": "reject",
+                "left": str(left),
+                "right": str(invalid),
+                "candidate_local_identifier": "candidate-id",
+                "keeper_local_identifier": "keeper-id",
+            }
+        )
+        + "\n"
     )
 
     exit_code = main(
