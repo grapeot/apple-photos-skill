@@ -2,26 +2,33 @@ from __future__ import annotations
 
 import hashlib
 import os
+import pwd
 import sqlite3
 from pathlib import Path
 from types import TracebackType
 
 from apple_photos_cli.errors import EXIT_AUTH, EXIT_LOCKED, ApplePhotosError, usage_error
+from apple_photos_cli.manifests import fsync_directory
 
 
 def default_state_dir() -> Path:
-    configured = os.environ.get("APPLE_PHOTOS_STATE_DIR")
-    if configured:
-        return Path(configured).expanduser()
-    return Path.home() / "Library" / "Application Support" / "apple-photos-skill"
+    return (
+        Path(pwd.getpwuid(os.getuid()).pw_dir)
+        / "Library"
+        / "Application Support"
+        / "apple-photos-skill"
+    )
 
 
 def ensure_state_dir(path: Path) -> Path:
     resolved = path.expanduser().resolve()
     if any(part.lower().endswith(".photoslibrary") for part in resolved.parts):
         raise usage_error("Application state must not be stored inside a .photoslibrary bundle.")
+    existed = resolved.is_dir()
     resolved.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(resolved, 0o700)
+    if not existed:
+        fsync_directory(resolved.parent)
     return resolved
 
 

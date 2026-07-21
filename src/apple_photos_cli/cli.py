@@ -123,7 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument("--library", type=Path)
     backup.add_argument("--output", type=Path, required=True)
 
-    evidence = commands.add_parser("evidence", help="Build read-only comparison evidence")
+    evidence = commands.add_parser("evidence", help="Build pixel comparison evidence")
     evidence_commands = evidence.add_subparsers(dest="evidence_command", required=True)
     compare = evidence_commands.add_parser(
         "compare-images", help="Compare frozen image pairs using deterministic pixel metrics"
@@ -164,12 +164,16 @@ def build_parser() -> argparse.ArgumentParser:
     import_batch_apply.add_argument("--apply", action="store_true", help="Confirm mutation intent")
     _add_status_parser(import_batch_commands)
 
-    delete = commands.add_parser("delete", help="Plan, authorize, or apply one-asset deletion")
+    delete = commands.add_parser(
+        "delete", help="Plan, authorize, or apply pixel-verified deletion"
+    )
     delete_commands = delete.add_subparsers(dest="delete_command", required=True)
     delete_plan = delete_commands.add_parser(
-        "plan", help="Create an integrity-checksummed dry-run delete plan"
+        "plan", help="Create a delete plan from authorizing pixel evidence"
     )
-    delete_plan.add_argument("--asset-id", required=True)
+    delete_plan.add_argument("--evidence-report", type=Path, required=True)
+    delete_plan.add_argument("--pair-manifest", type=Path, required=True)
+    delete_plan.add_argument("--network", choices=("allow", "deny"), default="deny")
     delete_plan.add_argument("--output", type=Path, required=True)
     _add_delete_authorize(delete_commands)
     _add_delete_apply(delete_commands)
@@ -180,9 +184,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     delete_batch_commands = delete_batch.add_subparsers(dest="delete_batch_command", required=True)
     delete_batch_plan = delete_batch_commands.add_parser(
-        "plan", help="Create a delete plan from a frozen JSON selection manifest"
+        "plan", help="Create a batch delete plan from authorizing pixel evidence"
     )
-    delete_batch_plan.add_argument("--selection-manifest", type=Path, required=True)
+    delete_batch_plan.add_argument("--evidence-report", type=Path, required=True)
+    delete_batch_plan.add_argument("--pair-manifest", type=Path, required=True)
+    delete_batch_plan.add_argument("--network", choices=("allow", "deny"), default="deny")
     delete_batch_plan.add_argument("--output", type=Path, required=True)
     _add_delete_authorize(delete_batch_commands)
     _add_delete_apply(delete_batch_commands)
@@ -446,22 +452,24 @@ def run(args: argparse.Namespace, *, stdin: TextIO = sys.stdin, stderr: TextIO =
             max_rgb_p99=args.max_rgb_p99,
         )
         report = compare_image_manifest(args.input_manifest, args.output, policy)
-        gate_passed = report["gate_passed"]
+        delete_authorizing = report["delete_authorizing"]
         render_json(
             {
                 "schema_version": SCHEMA_VERSION,
                 "command": "evidence.compare-images",
-                "ok": gate_passed,
-                "status": "succeeded" if gate_passed else "partial",
+                "ok": delete_authorizing,
+                "status": "succeeded" if delete_authorizing else "partial",
+                "gate_passed": report["gate_passed"],
+                "delete_authorizing": delete_authorizing,
                 "counts": report["counts"],
                 "artifacts": {"report": str(args.output.resolve())},
-                "warnings": [
-                    "Pixel similarity evidence is non-authorizing and cannot approve deletion."
-                ],
+                "warnings": []
+                if delete_authorizing
+                else ["Pixel evidence does not authorize delete planning."],
             },
             sys.stdout,
         )
-        return 0 if gate_passed else EXIT_PARTIAL
+        return 0 if delete_authorizing else EXIT_PARTIAL
     if args.command == "metadata":
         app = _application(args, reader=True)
         if args.metadata_command == "dump":
@@ -521,16 +529,12 @@ def run(args: argparse.Namespace, *, stdin: TextIO = sys.stdin, stderr: TextIO =
         return 0 if result.ok else EXIT_PARTIAL
 
     if group_command == "plan":
-        if args.command == "delete":
-            identifiers = [args.asset_id]
-        else:
-            selection = _load_json(args.selection_manifest)
-            if not isinstance(selection, dict) or not isinstance(selection.get("asset_ids"), list):
-                raise usage_error(
-                    "Selection manifest requires an asset_ids array.", code="E_SCHEMA_INVALID"
-                )
-            identifiers = selection["asset_ids"]
-        manifest = app.plan_delete(identifiers, output=args.output)
+        manifest = app.plan_delete(
+            args.evidence_report,
+            args.pair_manifest,
+            output=args.output,
+            network=args.network == "allow",
+        )
         render_json(
             {
                 "schema_version": SCHEMA_VERSION,

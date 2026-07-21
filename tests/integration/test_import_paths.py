@@ -440,3 +440,62 @@ def test_import_interrupt_after_dispatch_becomes_terminal_unknown(
     assert result.status == "outcome_unknown"
     assert result.errors[0]["exception_type"] == "KeyboardInterrupt"
     assert app.status(result.run_id)["status"] == "outcome_unknown"
+
+
+def test_import_known_precommit_rejection_is_not_attempted(
+    app, fake_bridge, tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source.jpg"
+    source.write_bytes(b"source")
+    manifest_path = tmp_path / "import.json"
+    app.plan_import([source], album_id="album-target", output=manifest_path)
+
+    def reject(*args, **kwargs):
+        raise ApplePhotosError(
+            "E_PERMISSION_PHOTOS",
+            "Synthetic permission rejection.",
+            EXIT_PARTIAL,
+            {"mutation_phase": "not_started"},
+        )
+
+    monkeypatch.setattr(fake_bridge, "import_assets", reject)
+    result = app.apply_import(manifest_path)
+
+    assert result.status == "partial"
+    assert result.phase == "commit_pending"
+    assert result.items[0]["status"] == "not_attempted"
+
+
+def test_later_precommit_rejection_preserves_created_identifier(
+    app, fake_bridge, tmp_path: Path, monkeypatch
+) -> None:
+    fake_bridge.add_asset("existing", b"duplicate")
+    new_source = tmp_path / "new.jpg"
+    duplicate_source = tmp_path / "duplicate.jpg"
+    new_source.write_bytes(b"new")
+    duplicate_source.write_bytes(b"duplicate")
+    manifest_path = tmp_path / "import.json"
+    app.plan_import(
+        [new_source, duplicate_source], album_id="album-target", output=manifest_path
+    )
+
+    def reject(*args, **kwargs):
+        raise ApplePhotosError(
+            "E_PERMISSION_PHOTOS",
+            "Synthetic album rejection.",
+            EXIT_PARTIAL,
+            {"mutation_phase": "not_started"},
+        )
+
+    monkeypatch.setattr(fake_bridge, "add_assets_to_album", reject)
+    result = app.apply_import(manifest_path)
+
+    assert result.status == "partial"
+    assert result.counts == {
+        "planned": 2,
+        "resolution_known": 1,
+        "not_attempted": 1,
+    }
+    assert result.items[0]["status"] == "resolution_known"
+    assert result.items[0]["local_identifier"] == "created-1"
+    assert result.items[1]["status"] == "not_attempted"

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from apple_photos_cli import CLI_MAJOR, SCHEMA_VERSION
-from apple_photos_cli.canonical import canonical_json_bytes
+from apple_photos_cli.canonical import canonical_json_bytes, sha256_digest
 from apple_photos_cli.errors import EXIT_AUTH, ApplePhotosError
 from apple_photos_cli.manifests import atomic_write_json, format_time, parse_time
 
@@ -76,6 +76,60 @@ class AuthorizationService:
         digest_prefix = str(manifest["manifest_sha256"]).removeprefix("sha256:")[:12]
         return f"DELETE {len(manifest['items'])} {digest_prefix}"
 
+    @staticmethod
+    def _delete_evidence_claims(manifest: Mapping[str, Any]) -> dict[str, Any]:
+        claims = {
+            key: value
+            for key, value in manifest.items()
+            if key not in {"evidence_attestation", "manifest_sha256"}
+        }
+        return {"purpose": "pixel_delete_plan_v1", "manifest": claims}
+
+    def attest_delete_evidence(self, manifest: Mapping[str, Any]) -> dict[str, str]:
+        claims = self._delete_evidence_claims(manifest)
+        signed_claims = canonical_json_bytes(claims)
+        signature = hmac.new(
+            self._secret(), signed_claims, hashlib.sha256
+        ).digest()
+        return {
+            "algorithm": "hmac-sha256",
+            "claims_sha256": sha256_digest(claims),
+            "signed_claims": _b64encode(signed_claims),
+            "signature": _b64encode(signature),
+        }
+
+    def verify_delete_evidence(self, manifest: Mapping[str, Any]) -> None:
+        attestation = manifest.get("evidence_attestation")
+        if not isinstance(attestation, dict) or set(attestation) != {
+            "algorithm",
+            "claims_sha256",
+            "signed_claims",
+            "signature",
+        }:
+            raise ApplePhotosError(
+                "E_AUTH_INVALID", "Delete evidence attestation is missing.", EXIT_AUTH
+            )
+        claims = self._delete_evidence_claims(manifest)
+        try:
+            signed_claims = _b64decode(attestation["signed_claims"])
+            signature = _b64decode(attestation["signature"])
+        except (KeyError, TypeError) as exc:
+            raise ApplePhotosError(
+                "E_AUTH_INVALID", "Delete evidence attestation is malformed.", EXIT_AUTH
+            ) from exc
+        if (
+            attestation.get("algorithm") != "hmac-sha256"
+            or attestation.get("claims_sha256") != sha256_digest(claims)
+            or signed_claims != canonical_json_bytes(claims)
+            or not hmac.compare_digest(
+                signature,
+                hmac.new(self._secret(), signed_claims, hashlib.sha256).digest(),
+            )
+        ):
+            raise ApplePhotosError(
+                "E_AUTH_INVALID", "Delete evidence attestation is invalid.", EXIT_AUTH
+            )
+
     def issue(
         self,
         manifest: Mapping[str, Any],
@@ -84,6 +138,11 @@ class AuthorizationService:
         stderr: TextIO,
         output: Path,
     ) -> dict[str, Any]:
+        self.verify_delete_evidence(manifest)
+        if len(manifest["items"]) > 50:
+            raise ApplePhotosError(
+                "E_AUTH_INVALID", "Delete authorization is limited to 50 items.", EXIT_AUTH
+            )
         if not stdin.isatty() or not stderr.isatty():
             raise ApplePhotosError(
                 "E_AUTH_REQUIRED",
@@ -115,6 +174,7 @@ class AuthorizationService:
             "schema_version": SCHEMA_VERSION,
             "action": "delete_assets",
             "manifest_sha256": manifest["manifest_sha256"],
+            "evidence_claims_sha256": manifest["evidence_attestation"]["claims_sha256"],
             "library_snapshot_digest": manifest["library_snapshot_digest"],
             "item_count": len(manifest["items"]),
             "issued_at": format_time(issued_at),
@@ -122,15 +182,25 @@ class AuthorizationService:
             "nonce": self.random_bytes(32).hex(),
             "cli_major": CLI_MAJOR,
         }
-        signature = hmac.new(self._secret(), canonical_json_bytes(claims), hashlib.sha256).digest()
-        token = {"claims": claims, "signature": _b64encode(signature)}
+        signed_claims = canonical_json_bytes(claims)
+        signature = hmac.new(self._secret(), signed_claims, hashlib.sha256).digest()
+        token = {
+            "claims": claims,
+            "signed_claims": _b64encode(signed_claims),
+            "signature": _b64encode(signature),
+        }
         atomic_write_json(output, token, mode=0o600)
         os.chmod(output, 0o600)
         return token
 
     def verify(self, token: Mapping[str, Any], manifest: Mapping[str, Any]) -> dict[str, Any]:
+        if set(token) != {"claims", "signed_claims", "signature"}:
+            raise ApplePhotosError(
+                "E_AUTH_INVALID", "Authorization token is malformed.", EXIT_AUTH
+            )
         try:
             claims = token["claims"]
+            signed_claims = _b64decode(token["signed_claims"])
             signature = _b64decode(token["signature"])
         except (KeyError, TypeError) as exc:
             raise ApplePhotosError(
@@ -140,16 +210,36 @@ class AuthorizationService:
             raise ApplePhotosError(
                 "E_AUTH_INVALID", "Authorization claims are malformed.", EXIT_AUTH
             )
-        expected_signature = hmac.new(
-            self._secret(), canonical_json_bytes(claims), hashlib.sha256
-        ).digest()
-        if not hmac.compare_digest(signature, expected_signature):
+        if set(claims) != {
+            "schema_version",
+            "action",
+            "manifest_sha256",
+            "evidence_claims_sha256",
+            "library_snapshot_digest",
+            "item_count",
+            "issued_at",
+            "expires_at",
+            "nonce",
+            "cli_major",
+        }:
+            raise ApplePhotosError(
+                "E_AUTH_INVALID", "Authorization claims are malformed.", EXIT_AUTH
+            )
+        if claims.get("schema_version") != SCHEMA_VERSION:
+            raise ApplePhotosError(
+                "E_AUTH_INVALID", "Authorization schema version is invalid.", EXIT_AUTH
+            )
+        expected_signature = hmac.new(self._secret(), signed_claims, hashlib.sha256).digest()
+        if signed_claims != canonical_json_bytes(claims) or not hmac.compare_digest(
+            signature, expected_signature
+        ):
             raise ApplePhotosError(
                 "E_AUTH_INVALID", "Authorization signature is invalid.", EXIT_AUTH
             )
         expected = {
             "action": "delete_assets",
             "manifest_sha256": manifest["manifest_sha256"],
+            "evidence_claims_sha256": manifest["evidence_attestation"]["claims_sha256"],
             "library_snapshot_digest": manifest["library_snapshot_digest"],
             "item_count": len(manifest["items"]),
             "cli_major": CLI_MAJOR,
@@ -161,7 +251,26 @@ class AuthorizationService:
                     f"Authorization claim does not match the plan: {key}.",
                     EXIT_AUTH,
                 )
-        if parse_time(claims["expires_at"]) <= self.now().astimezone(UTC):
+        try:
+            issued_at = parse_time(claims["issued_at"])
+            expires_at = parse_time(claims["expires_at"])
+        except (KeyError, TypeError) as exc:
+            raise ApplePhotosError(
+                "E_AUTH_INVALID", "Authorization timestamps are malformed.", EXIT_AUTH
+            ) from exc
+        if expires_at - issued_at > self.ttl or expires_at <= issued_at:
+            raise ApplePhotosError(
+                "E_AUTH_INVALID", "Authorization lifetime is invalid.", EXIT_AUTH
+            )
+        current_time = self.now().astimezone(UTC)
+        nonce = claims.get("nonce")
+        if not isinstance(nonce, str) or len(nonce) != 64 or any(
+            character not in "0123456789abcdef" for character in nonce
+        ):
+            raise ApplePhotosError(
+                "E_AUTH_INVALID", "Authorization nonce is invalid.", EXIT_AUTH
+            )
+        if expires_at <= current_time:
             raise ApplePhotosError("E_AUTH_EXPIRED", "Authorization token has expired.", EXIT_AUTH)
         return claims
 

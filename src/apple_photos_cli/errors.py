@@ -43,5 +43,7 @@ def unsupported(message: str, *, code: str = "E_CAPABILITY_UNSUPPORTED") -> Appl
     return ApplePhotosError(code, message, EXIT_UNSUPPORTED)
 
 
-def stale(message: str, *, code: str = "E_PLAN_STALE") -> ApplePhotosError:
-    return ApplePhotosError(code, message, EXIT_STALE)
+def stale(
+    message: str, *, code: str = "E_PLAN_STALE", detail: dict[str, Any] | None = None
+) -> ApplePhotosError:
+    return ApplePhotosError(code, message, EXIT_STALE, detail)

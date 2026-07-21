@@ -136,3 +136,18 @@ def test_native_helper_uses_no_applescript_or_gui_automation() -> None:
     assert "osascript" not in lowered
     assert "systemevents" not in lowered
     assert "photos.sqlite" not in lowered
+
+
+def test_native_delete_uses_fixed_signed_trust_boundary() -> None:
+    root = Path(__file__).resolve().parents[2]
+    source = (root / "native/PhotoKitHelper/Sources/PhotoKitHelper/main.swift").read_text(
+        encoding="utf-8"
+    )
+
+    assert "APPLE_PHOTOS_AUTH_SECRET_FILE" not in source
+    assert "homeDirectoryForCurrentUser" not in source
+    assert "getpwuid(getuid())" in source
+    assert "HMAC<SHA256>.isValidAuthenticationCode" in source
+    assert "native-nonces" in source
+    assert "O_EXCL" in source
+    assert "items.count <= 50" in source

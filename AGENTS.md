@@ -2,16 +2,16 @@
 
 ## Project Role
 
-Provides a safety-oriented Python CLI and agent skill to inspect Apple Photos metadata and plan PhotoKit mutations. Database writes, GUI automation, visual deduplication, and media backups are unsupported.
+Provides a safety-oriented Python CLI and agent skill to inspect Apple Photos metadata and plan PhotoKit mutations. Database writes, GUI automation, byte-identical duplicate deletion, and media backups are unsupported.
 
 ## Non-Negotiable Safety Rules
 
 - **Database Safety**: Never write, migrate, repair, vacuum, or mutate Photos SQLite databases. Keep `osxphotos==0.76.1` read-only; never suggest `osxphotos import`.
 - **Target Seam**: Limit mutations to the native Swift PhotoKit helper targeting the System Photo Library only.
 - **Dry-run Default**: Imports and deletions default to planning; applying requires a frozen manifest and `--apply`.
-- **Delete Authorization**: Deletions require interactive TTY confirmation and a short-lived, single-use, manifest-bound HMAC token.
+- **Delete Authorization**: Deletions require interactive TTY confirmation and a short-lived, single-use, manifest-bound HMAC token. Enforce replay prevention in both the Python orchestrator and native helper.
 - **Delete Execution**: Assets move to Recently Deleted only. Never empty Recently Deleted or bypass macOS confirmation prompts.
-- **Duplicate Verification**: Enforce full SHA-256 resource equality. Filenames, sizes, visual matches, or database fingerprints do not prove duplicate status.
+- **Delete Evidence**: Deletion supports byte-different, single-resource still-image pairs only. Reject compound, partially available, and non-photo resource sets. Require equal dimensions and the canonical pixel thresholds (RGB MAE <= 1%, luma MAE <= 1%, RGB P99 <= 5%). Bind source bytes to candidate and keeper PhotoKit resources with SHA-256, but never use SHA-256 equality as the deletion criterion. Byte-identical duplicate deletion is unsupported.
 - **Failure Handling**: Fail closed if resource coverage, library snapshots, or conditions cannot be verified. Do not claim public PhotoKit proves physical library identity.
 - **Testing**: Default to synthetic fixtures. Run live mutation tests only on explicit request using a disposable library.
 

@@ -11,7 +11,7 @@ from typing import Any, TextIO
 
 from apple_photos_cli import SCHEMA_VERSION, __version__
 from apple_photos_cli.canonical import canonical_json_bytes
-from apple_photos_cli.manifests import atomic_write_json
+from apple_photos_cli.manifests import atomic_write_json, fsync_directory
 from apple_photos_cli.models import AlbumRecord, AssetRecord, LibrarySnapshot
 
 
@@ -130,11 +130,13 @@ def create_metadata_backup(
         }
         atomic_write_json(temporary / "manifest.json", manifest)
         os.replace(temporary, output)
+        fsync_directory(output.parent)
         complete = output / "COMPLETE"
         with complete.open("xb") as handle:
             handle.write(b"complete\n")
             handle.flush()
             os.fsync(handle.fileno())
+        fsync_directory(output)
         return manifest
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)

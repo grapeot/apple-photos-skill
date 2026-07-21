@@ -27,9 +27,9 @@
         "required": ["item_id", "status"],
         "properties": {
           "item_id": {"type": "string"}, "local_identifier": {"type": "string"},
-          "status": {"enum": ["resolution_known", "imported_verified", "reused_verified", "imported_integrity_failed", "deleted_confirmed", "outcome_unknown", "not_attempted_after_unknown"]},
+          "status": {"enum": ["resolution_known", "imported_verified", "reused_verified", "imported_integrity_failed", "deleted_confirmed", "outcome_unknown", "not_attempted", "not_attempted_after_unknown"]},
           "resource_digest_match": {"type": "boolean"}, "album_membership_verified": {"type": "boolean"},
-          "evidence": {"enum": ["photokit_placeholder", "placeholder_missing_after_creation_registered", "transaction_outcome_unknown", "not_attempted_after_unknown", "batch_duplicate_parent_outcome_unknown", "batch_duplicate_parent_not_attempted_after_unknown", "batch_duplicate_parent", "exact_duplicate_sha256"]}
+          "evidence": {"enum": ["photokit_placeholder", "placeholder_missing_after_creation_registered", "transaction_outcome_unknown", "transaction_not_started", "not_attempted", "not_attempted_after_unknown", "batch_duplicate_parent_outcome_unknown", "batch_duplicate_parent_not_attempted", "batch_duplicate_parent_not_attempted_after_unknown", "batch_duplicate_parent", "exact_duplicate_sha256"]}
         },
         "additionalProperties": false
       }

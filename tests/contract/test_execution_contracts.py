@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
-from conftest import FIXED_TIME
+from conftest import FIXED_TIME, write_pixel_report
 
 from apple_photos_cli import cli
 from apple_photos_cli.authorization import AuthorizationService
@@ -71,7 +71,8 @@ def test_cli_delete_success_outputs_receipt(
 ) -> None:
     fake_bridge.add_asset("delete-id", b"delete")
     manifest_path = tmp_path / "delete.json"
-    manifest = app.plan_delete(["delete-id"], output=manifest_path)
+    report, pairs = write_pixel_report(fake_bridge, tmp_path / "pixel.json", ["delete-id"])
+    manifest = app.plan_delete(report, pairs, output=manifest_path)
     token_path = tmp_path / "delete.token"
     service = AuthorizationService(
         app.state_dir,
@@ -110,14 +111,17 @@ def test_cli_delete_plan_authorize_apply_complete_chain(
     fake_bridge.add_asset("delete-id", b"delete")
     manifest_path = tmp_path / "delete.json"
     token_path = tmp_path / "delete.token"
+    report, pairs = write_pixel_report(fake_bridge, tmp_path / "pixel.json", ["delete-id"])
     monkeypatch.setattr(cli, "_application", lambda args, reader: app)
 
     assert cli.main(
         [
             "delete",
             "plan",
-            "--asset-id",
-            "delete-id",
+            "--evidence-report",
+            str(report),
+            "--pair-manifest",
+            str(pairs),
             "--output",
             str(manifest_path),
         ]
@@ -165,7 +169,8 @@ def test_cli_authorize_rejects_non_tty_and_wrong_phrase(
 ) -> None:
     fake_bridge.add_asset("delete-id", b"delete")
     manifest_path = tmp_path / "delete.json"
-    app.plan_delete(["delete-id"], output=manifest_path)
+    report, pairs = write_pixel_report(fake_bridge, tmp_path / "pixel.json", ["delete-id"])
+    app.plan_delete(report, pairs, output=manifest_path)
     monkeypatch.setattr(cli, "_application", lambda args, reader: app)
     argv = [
         "delete",
@@ -193,7 +198,8 @@ def test_cli_wrong_delete_token_is_auth_error_without_mutation(
 ) -> None:
     fake_bridge.add_asset("delete-id", b"delete")
     manifest_path = tmp_path / "delete.json"
-    manifest = app.plan_delete(["delete-id"], output=manifest_path)
+    report, pairs = write_pixel_report(fake_bridge, tmp_path / "pixel.json", ["delete-id"])
+    manifest = app.plan_delete(report, pairs, output=manifest_path)
     token_path = tmp_path / "delete.token"
     service = AuthorizationService(app.state_dir)
     service.issue(

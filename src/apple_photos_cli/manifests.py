@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,14 @@ from apple_photos_cli.errors import EXIT_IO, ApplePhotosError, stale, usage_erro
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def format_time(value: datetime) -> str:
@@ -78,6 +86,13 @@ def validate_manifest(manifest: dict[str, Any], *, expected_type: str | None = N
 
 
 def _validate_manifest_semantics(manifest: dict[str, Any]) -> None:
+    created_at = parse_time(manifest["created_at"])
+    expires_at = parse_time(manifest["expires_at"])
+    if expires_at <= created_at or expires_at - created_at > timedelta(hours=24):
+        raise usage_error(
+            "Manifest lifetime must be positive and no longer than 24 hours.",
+            code="E_SCHEMA_INVALID",
+        )
     item_ids = [item["item_id"] for item in manifest["items"]]
     if len(item_ids) != len(set(item_ids)):
         raise usage_error("Manifest item identifiers must be unique.", code="E_SCHEMA_INVALID")
@@ -87,6 +102,46 @@ def _validate_manifest_semantics(manifest: dict[str, Any]) -> None:
             for item in manifest["items"]
         ):
             raise usage_error("Delete manifest action is invalid.", code="E_SCHEMA_INVALID")
+        policy = manifest["delete_policy"]["policy"]
+        if (
+            policy["max_rgb_mae"] > 0.01
+            or policy["max_luma_mae"] > 0.01
+            or policy["max_rgb_p99"] > 0.05
+        ):
+            raise usage_error(
+                "Delete pixel policy exceeds the supported safety thresholds.",
+                code="E_SCHEMA_INVALID",
+            )
+        candidates = [item["local_identifier"] for item in manifest["items"]]
+        keepers = {
+            item["pixel_similarity_proof"]["keeper_local_identifier"]
+            for item in manifest["items"]
+        }
+        pair_ids = [
+            item["pixel_similarity_proof"]["pair_id"] for item in manifest["items"]
+        ]
+        if (
+            len(candidates) != len(set(candidates))
+            or len(pair_ids) != len(set(pair_ids))
+            or set(candidates) & keepers
+        ):
+            raise usage_error(
+                "Delete pixel candidate, keeper, and pair identifiers are inconsistent.",
+                code="E_SCHEMA_INVALID",
+            )
+        for item in manifest["items"]:
+            proof = item["pixel_similarity_proof"]
+            metrics = proof["metrics"]
+            if (
+                proof["candidate_source_sha256"] == proof["keeper_source_sha256"]
+                or metrics["rgb_mean_absolute_error"] > policy["max_rgb_mae"]
+                or metrics["luma_mean_absolute_error"] > policy["max_luma_mae"]
+                or metrics["rgb_p99_absolute_error"] > policy["max_rgb_p99"]
+            ):
+                raise usage_error(
+                    f"Delete pixel proof is not eligible for {item['item_id']}.",
+                    code="E_SCHEMA_INVALID",
+                )
         return
     if manifest["manifest_type"] != "apple_photos_import":
         return
@@ -144,7 +199,8 @@ def atomic_write_json(path: Path, value: Any, *, mode: int = 0o644) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
-    except Exception:
+        fsync_directory(path.parent)
+    except BaseException:
         temporary_path.unlink(missing_ok=True)
         raise
 
