@@ -44,6 +44,27 @@ def test_authorization_requires_exact_tty_phrase(app, fake_bridge, tmp_path: Pat
     assert phrase.startswith("DELETE 1 ")
 
 
+def test_authorization_prompt_includes_ai_agent_guard(app, fake_bridge, tmp_path: Path) -> None:
+    manifest = _delete_manifest(app, fake_bridge, tmp_path)
+    service = AuthorizationService(
+        app.state_dir,
+        now=lambda: FIXED_TIME,
+        random_bytes=lambda length: b"r" * length,
+    )
+    stderr = TTYBuffer()
+    service.issue(
+        manifest,
+        stdin=TTYBuffer(service.required_phrase(manifest) + "\n"),
+        stderr=stderr,
+        output=tmp_path / "token",
+    )
+    prompt = stderr.getvalue()
+    assert "AI AGENT GUARD" in prompt
+    assert "MUST NOT" in prompt
+    assert "explicit human authorization" in prompt
+    assert "question tool" in prompt
+
+
 def test_authorization_rejects_non_tty(app, fake_bridge, tmp_path: Path) -> None:
     manifest = _delete_manifest(app, fake_bridge, tmp_path)
     service = AuthorizationService(app.state_dir, now=lambda: FIXED_TIME)
